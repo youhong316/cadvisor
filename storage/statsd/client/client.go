@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 )
 
 type Client struct {
@@ -30,7 +30,7 @@ type Client struct {
 func (self *Client) Open() error {
 	conn, err := net.Dial("udp", self.HostPort)
 	if err != nil {
-		glog.Errorf("failed to open udp connection to %q: %v", self.HostPort, err)
+		klog.Errorf("failed to open udp connection to %q: %v", self.HostPort, err)
 		return err
 	}
 	self.conn = conn
@@ -49,8 +49,7 @@ func (self *Client) Send(namespace, containerName, key string, value uint64) err
 	formatted := fmt.Sprintf("%s.%s.%s:%d|g", namespace, containerName, key, value)
 	_, err := fmt.Fprintf(self.conn, formatted)
 	if err != nil {
-		glog.V(3).Infof("failed to send data %q: %v", formatted, err)
-		return err
+		return fmt.Errorf("failed to send data %q: %v", formatted, err)
 	}
 	return nil
 }

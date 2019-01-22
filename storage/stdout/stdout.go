@@ -19,7 +19,12 @@ import (
 	"fmt"
 
 	info "github.com/google/cadvisor/info/v1"
+	"github.com/google/cadvisor/storage"
 )
+
+func init() {
+	storage.RegisterStorageDriver("stdout", new)
+}
 
 type stdoutStorage struct {
 	Namespace string
@@ -46,6 +51,10 @@ const (
 	// Filesystem usage.
 	colFsUsage = "fs_usage"
 )
+
+func new() (storage.StorageDriver, error) {
+	return newStorage(*storage.ArgDbHost)
+}
 
 func (driver *stdoutStorage) containerStatsToValues(stats *info.ContainerStats) (series map[string]uint64) {
 	series = make(map[string]uint64)
@@ -80,14 +89,14 @@ func (driver *stdoutStorage) containerFsStatsToValues(series *map[string]uint64,
 	}
 }
 
-func (driver *stdoutStorage) AddStats(ref info.ContainerReference, stats *info.ContainerStats) error {
+func (driver *stdoutStorage) AddStats(cInfo *info.ContainerInfo, stats *info.ContainerStats) error {
 	if stats == nil {
 		return nil
 	}
 
-	containerName := ref.Name
-	if len(ref.Aliases) > 0 {
-		containerName = ref.Aliases[0]
+	containerName := cInfo.ContainerReference.Name
+	if len(cInfo.ContainerReference.Aliases) > 0 {
+		containerName = cInfo.ContainerReference.Aliases[0]
 	}
 
 	var buffer bytes.Buffer
@@ -108,7 +117,7 @@ func (driver *stdoutStorage) Close() error {
 	return nil
 }
 
-func New(namespace string) (*stdoutStorage, error) {
+func newStorage(namespace string) (*stdoutStorage, error) {
 	stdoutStorage := &stdoutStorage{
 		Namespace: namespace,
 	}

@@ -23,6 +23,8 @@ import (
 	"testing"
 
 	"github.com/google/cadvisor/info/v1"
+
+	containertest "github.com/google/cadvisor/container/testing"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -37,13 +39,14 @@ func TestEmptyConfig(t *testing.T) {
         }
         `
 
-	//Create a temporary config file 'temp.json' with invalid json format
+	// Create a temporary config file 'temp.json' with invalid json format
 	assert.NoError(ioutil.WriteFile("temp.json", []byte(emptyConfig), 0777))
 
 	configFile, err := ioutil.ReadFile("temp.json")
 	assert.NoError(err)
 
-	_, err = NewCollector("tempCollector", configFile)
+	containerHandler := containertest.NewMockContainerHandler("mockContainer")
+	_, err = NewCollector("tempCollector", configFile, 100, containerHandler, http.DefaultClient)
 	assert.Error(err)
 
 	assert.NoError(os.Remove("temp.json"))
@@ -52,7 +55,7 @@ func TestEmptyConfig(t *testing.T) {
 func TestConfigWithErrors(t *testing.T) {
 	assert := assert.New(t)
 
-	//Syntax error: Missed '"' after activeConnections
+	// Syntax error: Missed '"' after activeConnections
 	invalid := `
 	{
 		"endpoint" : "http://localhost:8000/nginx_status",
@@ -68,12 +71,13 @@ func TestConfigWithErrors(t *testing.T) {
 	}
 	`
 
-	//Create a temporary config file 'temp.json' with invalid json format
+	// Create a temporary config file 'temp.json' with invalid json format
 	assert.NoError(ioutil.WriteFile("temp.json", []byte(invalid), 0777))
 	configFile, err := ioutil.ReadFile("temp.json")
 	assert.NoError(err)
 
-	_, err = NewCollector("tempCollector", configFile)
+	containerHandler := containertest.NewMockContainerHandler("mockContainer")
+	_, err = NewCollector("tempCollector", configFile, 100, containerHandler, http.DefaultClient)
 	assert.Error(err)
 
 	assert.NoError(os.Remove("temp.json"))
@@ -82,7 +86,7 @@ func TestConfigWithErrors(t *testing.T) {
 func TestConfigWithRegexErrors(t *testing.T) {
 	assert := assert.New(t)
 
-	//Error: Missed operand for '+' in activeConnections regex
+	// Error: Missed operand for '+' in activeConnections regex
 	invalid := `
         {
                 "endpoint" : "host:port/nginx_status",
@@ -105,13 +109,14 @@ func TestConfigWithRegexErrors(t *testing.T) {
         }
         `
 
-	//Create a temporary config file 'temp.json'
+	// Create a temporary config file 'temp.json'
 	assert.NoError(ioutil.WriteFile("temp.json", []byte(invalid), 0777))
 
 	configFile, err := ioutil.ReadFile("temp.json")
 	assert.NoError(err)
 
-	_, err = NewCollector("tempCollector", configFile)
+	containerHandler := containertest.NewMockContainerHandler("mockContainer")
+	_, err = NewCollector("tempCollector", configFile, 100, containerHandler, http.DefaultClient)
 	assert.Error(err)
 
 	assert.NoError(os.Remove("temp.json"))
@@ -120,25 +125,44 @@ func TestConfigWithRegexErrors(t *testing.T) {
 func TestConfig(t *testing.T) {
 	assert := assert.New(t)
 
-	//Create an nginx collector using the config file 'sample_config.json'
+	// Create an nginx collector using the config file 'sample_config.json'
 	configFile, err := ioutil.ReadFile("config/sample_config.json")
 	assert.NoError(err)
 
-	collector, err := NewCollector("nginx", configFile)
+	containerHandler := containertest.NewMockContainerHandler("mockContainer")
+	collector, err := NewCollector("nginx", configFile, 100, containerHandler, http.DefaultClient)
 	assert.NoError(err)
 	assert.Equal(collector.name, "nginx")
-	assert.Equal(collector.configFile.Endpoint, "http://localhost:8000/nginx_status")
+	assert.Equal(collector.configFile.Endpoint.URL, "http://localhost:8000/nginx_status")
+	assert.Equal(collector.configFile.MetricsConfig[0].Name, "activeConnections")
+}
+
+func TestEndpointConfig(t *testing.T) {
+	assert := assert.New(t)
+	configFile, err := ioutil.ReadFile("config/sample_config_endpoint_config.json")
+	assert.NoError(err)
+
+	containerHandler := containertest.NewMockContainerHandler("mockContainer")
+	containerHandler.On("GetContainerIPAddress").Return(
+		"111.111.111.111",
+	)
+
+	collector, err := NewCollector("nginx", configFile, 100, containerHandler, http.DefaultClient)
+	assert.NoError(err)
+	assert.Equal(collector.name, "nginx")
+	assert.Equal(collector.configFile.Endpoint.URL, "https://111.111.111.111:8000/nginx_status")
 	assert.Equal(collector.configFile.MetricsConfig[0].Name, "activeConnections")
 }
 
 func TestMetricCollection(t *testing.T) {
 	assert := assert.New(t)
 
-	//Collect nginx metrics from a fake nginx endpoint
+	// Collect nginx metrics from a fake nginx endpoint
 	configFile, err := ioutil.ReadFile("config/sample_config.json")
 	assert.NoError(err)
 
-	fakeCollector, err := NewCollector("nginx", configFile)
+	containerHandler := containertest.NewMockContainerHandler("mockContainer")
+	fakeCollector, err := NewCollector("nginx", configFile, 100, containerHandler, http.DefaultClient)
 	assert.NoError(err)
 
 	tempServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -146,22 +170,34 @@ func TestMetricCollection(t *testing.T) {
 		fmt.Fprintln(w, "5 5 32\nReading: 0 Writing: 1 Waiting: 2")
 	}))
 	defer tempServer.Close()
-	fakeCollector.configFile.Endpoint = tempServer.URL
+	fakeCollector.configFile.Endpoint.URL = tempServer.URL
 
 	metrics := map[string][]v1.MetricVal{}
 	_, metrics, errMetric := fakeCollector.Collect(metrics)
 	assert.NoError(errMetric)
 	metricNames := []string{"activeConnections", "reading", "writing", "waiting"}
 	// activeConnections = 3
-	assert.Equal(metrics[metricNames[0]][0].IntValue, 3)
-	assert.Equal(metrics[metricNames[0]][0].FloatValue, 0)
+	assert.Equal(metrics[metricNames[0]][0].IntValue, int64(3))
+	assert.Equal(metrics[metricNames[0]][0].FloatValue, float64(0))
 	// reading = 0
-	assert.Equal(metrics[metricNames[1]][0].IntValue, 0)
-	assert.Equal(metrics[metricNames[1]][0].FloatValue, 0)
+	assert.Equal(metrics[metricNames[1]][0].IntValue, int64(0))
+	assert.Equal(metrics[metricNames[1]][0].FloatValue, float64(0))
 	// writing = 1
-	assert.Equal(metrics[metricNames[2]][0].IntValue, 1)
-	assert.Equal(metrics[metricNames[2]][0].FloatValue, 0)
+	assert.Equal(metrics[metricNames[2]][0].IntValue, int64(1))
+	assert.Equal(metrics[metricNames[2]][0].FloatValue, float64(0))
 	// waiting = 2
-	assert.Equal(metrics[metricNames[3]][0].IntValue, 2)
-	assert.Equal(metrics[metricNames[3]][0].FloatValue, 0)
+	assert.Equal(metrics[metricNames[3]][0].IntValue, int64(2))
+	assert.Equal(metrics[metricNames[3]][0].FloatValue, float64(0))
+}
+
+func TestMetricCollectionLimit(t *testing.T) {
+	assert := assert.New(t)
+
+	// Collect nginx metrics from a fake nginx endpoint
+	configFile, err := ioutil.ReadFile("config/sample_config.json")
+	assert.NoError(err)
+
+	containerHandler := containertest.NewMockContainerHandler("mockContainer")
+	_, err = NewCollector("nginx", configFile, 1, containerHandler, http.DefaultClient)
+	assert.Error(err)
 }

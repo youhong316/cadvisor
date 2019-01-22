@@ -1,5 +1,190 @@
 # Changelog
 
+### 0.32.0 (2018-11-12)
+- Add container process and file descriptor metrics (disabled by default)
+- Rename `type` label to `failure_type` for prometheus `memory_failures_total` metric
+- Reduce mesos error logging when mesos not present
+
+### 0.31.0 (2018-09-07)
+- Fix NVML initialization race condition
+- Fix brtfs filesystem discovery
+- Fix race condition with AllDockerContainers
+- Don't watch .mount cgroups
+- Reduce lock contention during list containers
+- Don't produce prometheus metrics for ignored metrics
+- Add option to not export container labels as prometheus labels
+- Docs: Publish cAdvisor daemonset
+- Docs: Add documentation for exported prometheus metrics
+
+### 0.30.1 (2018-06-11)
+- Revert switch from inotify to fsnotify
+
+### 0.30.0 (2018-06-05)
+- Use IONice to reduce IO priority of `du` and `find`
+- BREAKING API CHANGE: ContainerReference no longer contains Labels.  Use ContainerSpec instead.
+- Add schedstat metrics, disabled by default.
+- Fix a bug where cadvisor failed to discover a sub-cgroup that was created soon after the parent cgroup.
+
+### 0.29.0 (2018-02-20)
+- Disable per-cpu metrics by default for scalability
+- Fix disk usage monitoring of overlayFs
+- Retry docker connection on startup timeout
+
+### 0.28.3 (2017-12-7)
+- Add timeout for docker calls
+- Fix prometheus label consistency
+
+### 0.28.2 (2017-11-21)
+- Fix GPU init race condition
+
+### 0.28.1 (2017-11-20)
+- Add containerd support
+- Fix fsnotify regression from 0.28.0
+- Add on demand metrics
+
+### 0.28.0 (2017-11-06)
+- Add container nvidia GPU metrics
+- Expose container memory max_usage_in_bytes
+- Add container memory reservation to prometheus
+
+### 0.27.1 (2017-09-06)
+- Add CRI-O support
+
+### 0.27.0 (2017-09-01)
+- Fix journalctl leak
+- Fix container memory rss
+- Add hugepages support
+- Fix incorrect CPU usage with 4.7 kernel
+- OOM parser uses kmsg
+- Add tmpfs support
+
+### 0.26.1 (2017-06-21)
+- Fix prometheus metrics.
+
+### 0.26.0 (2017-05-31)
+- Fix disk partition discovery for brtfs
+- Add ZFS support
+- Add UDP metrics (collection disabled by default)
+- Improve diskio prometheus metrics
+- Update Prometheus godeps to v0.8
+- Add overlay2 storage driver support
+
+### 0.25.0 (2017-03-09)
+- Disable thin_ls due to excessive iops
+- Ignore .mount cgroups, fixing dissappearing stats
+- Fix wc goroutine leak
+- Update aws-sdk-go dependency to 1.6.10
+- Update to go 1.7 for releases
+
+### 0.24.1 (2016-10-10)
+
+- Fix issue with running cAdvisor in a container on some distributions.
+
+### 0.24.0 (2016-09-19)
+
+- Added host-level inode stats (total & available)
+- Improved robustness to partial failures
+- Metrics collector improvements
+  - Added ability to directly use endpoints from the container itself
+  - Allow SSL endpoint access
+  - Ability to provide a certificate which is exposed to custom endpoints
+- Lots of bug fixes, including:
+  - Devicemapper thin_ls fixes
+  - Prometheus metrics fixes
+  - Fixes for missing stats (memory reservation, FS usage, etc.)
+
+### 0.23.9 (2016-08-09)
+
+- Cherry-pick release:
+  - Ensure minimum kernel version for thin_ls
+
+### 0.23.8 (2016-08-02)
+
+- Cherry-pick release:
+  - Prefix Docker labels & env vars in Prometheus metrics to prevent conflicts
+
+### 0.23.7 (2016-07-18)
+
+- Cherry-pick release:
+  - Modify working set memory stats calculation
+
+### 0.23.6 (2016-06-23)
+
+- Cherry-pick release:
+  - Updating inotify to fix memory leak v0.23 cherrypick
+
+### 0.23.5 (2016-06-22)
+
+- Cherry-pick release:
+  - support LVM based device mapper storage drivers
+
+### 0.23.4 (2016-06-16)
+- Cherry-pick release:
+  - Check for thin_is binary in path for devicemapper when using ThinPoolWatcher
+  - Fix uint64 overflow issue for CPU stats
+
+### 0.23.3 (2016-06-08)
+- Cherry-pick release:
+  - Cap the maximum consecutive du commands
+  - Fix a panic when a prometheus endpoint ends with a newline
+
+### 0.23.2 (2016-05-18)
+- Handle kernel log rotation
+- More rkt support: poll rkt service for new containers
+- Better handling of partial failures when fetching subcontainers
+- Devicemapper thin_ls support (requires Device Mapper kernel module and supporting utilities)
+
+### 0.23.1 (2016-05-11)
+- Add multi-container charts to the UI
+- Add TLS options for Kafka storage driver
+- Switch to official Docker client
+- Systemd:
+  - Ignore .mount cgroups on systemd
+  - Better OOM monitoring
+- Bug: Fix broken -disable_metrics flag
+- Bug: Fix openstack identified as AWS
+- Bug: Fix EventStore when limit is 0
+
+### 0.23.0 (2016-04-21)
+- Docker v1.11 support
+- Preliminary rkt support
+- Bug: Fix file descriptor leak
+
+### 0.22.0 (2016-02-25)
+- Disk usage calculation bug fixes
+- Systemd integration bug fixes
+- Instance ID support for Azure and AWS
+- Limit number of custom metrics
+- Support opt out for disk and network metrics
+
+### 0.21.0 (2016-02-03)
+- Support for filesystem stats with docker v1.10
+- Bug fixes.
+
+### 0.20.5 (2016-01-27)
+- Breaking: Use uint64 for memory stats
+- Bug: Fix devicemapper partition labelling
+- Bug: Fix network stats when using new Docker network functionality
+- Bug: Fix env var label mapping initialization
+- Dependencies: libcontainer update
+
+### 0.20.4 (2016-01-20)
+- Godep updates
+
+### 0.20.3 (2016-01-19)
+- Bug fixes
+- Jitter added to housekeeping to smooth CPU usage.
+
+### 0.20.2 (2016-01-15)
+- New v2.1 API with better filesystem stats
+- Internal refactoring
+- Bug fixes.
+
+### 0.18.0 (2015-09-23)
+- Large bunch of bug-fixes
+- Fixed networking stats for newer docker versions using libnetwork.
+- Added application-specific metrics
+
 ## 0.16.0 (2015-06-26)
 - Misc fixes.
 
@@ -39,7 +224,7 @@
 - Enabled CPU load tracking (experimental).
 
 ## 0.11.0 (2015-03-27)
-- Export all stats as [Prometheus](http://prometheus.io/) metrics.
+- Export all stats as [Prometheus](https://prometheus.io/) metrics.
 - Initial support for [events](docs/api.md): creation, deletion, and OOM.
 - Adding machine UUID information.
 - Beta release of the cAdvisor [2.0 API](docs/api_v2.md).

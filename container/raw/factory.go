@@ -17,12 +17,16 @@ package raw
 import (
 	"flag"
 	"fmt"
+	"strings"
 
-	"github.com/golang/glog"
 	"github.com/google/cadvisor/container"
+	"github.com/google/cadvisor/container/common"
 	"github.com/google/cadvisor/container/libcontainer"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
+	watch "github.com/google/cadvisor/manager/watcher"
+
+	"k8s.io/klog"
 )
 
 var dockerOnly = flag.Bool("docker_only", false, "Only report docker containers in addition to root stats")
@@ -38,7 +42,13 @@ type rawFactory struct {
 	fsInfo fs.FsInfo
 
 	// Watcher for inotify events.
-	watcher *InotifyWatcher
+	watcher *common.InotifyWatcher
+
+	// List of metrics to be included.
+	includedMetrics map[container.MetricKind]struct{}
+
+	// List of raw container cgroup path prefix whitelist.
+	rawPrefixWhiteList []string
 }
 
 func (self *rawFactory) String() string {
@@ -50,34 +60,28 @@ func (self *rawFactory) NewContainerHandler(name string, inHostNamespace bool) (
 	if !inHostNamespace {
 		rootFs = "/rootfs"
 	}
-	return newRawContainerHandler(name, self.cgroupSubsystems, self.machineInfoFactory, self.fsInfo, self.watcher, rootFs)
+	return newRawContainerHandler(name, self.cgroupSubsystems, self.machineInfoFactory, self.fsInfo, self.watcher, rootFs, self.includedMetrics)
 }
 
 // The raw factory can handle any container. If --docker_only is set to false, non-docker containers are ignored.
 func (self *rawFactory) CanHandleAndAccept(name string) (bool, bool, error) {
 	accept := name == "/" || !*dockerOnly
+
+	for _, prefix := range self.rawPrefixWhiteList {
+		if strings.HasPrefix(name, prefix) {
+			accept = true
+			break
+		}
+	}
 	return true, accept, nil
 }
 
 func (self *rawFactory) DebugInfo() map[string][]string {
-	out := make(map[string][]string)
-
-	// Get information about inotify watches.
-	watches := self.watcher.GetWatches()
-	lines := make([]string, 0, len(watches))
-	for containerName, cgroupWatches := range watches {
-		lines = append(lines, fmt.Sprintf("%s:", containerName))
-		for _, cg := range cgroupWatches {
-			lines = append(lines, fmt.Sprintf("\t%s", cg))
-		}
-	}
-	out["Inotify watches"] = lines
-
-	return out
+	return common.DebugInfo(self.watcher.GetWatches())
 }
 
-func Register(machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo) error {
-	cgroupSubsystems, err := libcontainer.GetCgroupSubsystems()
+func Register(machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo, includedMetrics map[container.MetricKind]struct{}, rawPrefixWhiteList []string) error {
+	cgroupSubsystems, err := libcontainer.GetCgroupSubsystems(includedMetrics)
 	if err != nil {
 		return fmt.Errorf("failed to get cgroup subsystems: %v", err)
 	}
@@ -85,18 +89,20 @@ func Register(machineInfoFactory info.MachineInfoFactory, fsInfo fs.FsInfo) erro
 		return fmt.Errorf("failed to find supported cgroup mounts for the raw factory")
 	}
 
-	watcher, err := NewInotifyWatcher()
+	watcher, err := common.NewInotifyWatcher()
 	if err != nil {
 		return err
 	}
 
-	glog.Infof("Registering Raw factory")
+	klog.V(1).Infof("Registering Raw factory")
 	factory := &rawFactory{
 		machineInfoFactory: machineInfoFactory,
 		fsInfo:             fsInfo,
 		cgroupSubsystems:   &cgroupSubsystems,
 		watcher:            watcher,
+		includedMetrics:    includedMetrics,
+		rawPrefixWhiteList: rawPrefixWhiteList,
 	}
-	container.RegisterContainerHandlerFactory(factory)
+	container.RegisterContainerHandlerFactory(factory, []watch.ContainerWatchSource{watch.Raw})
 	return nil
 }

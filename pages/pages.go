@@ -21,11 +21,12 @@ import (
 	"net/url"
 	"strings"
 
-	auth "github.com/abbot/go-http-auth"
-	"github.com/golang/glog"
-	httpMux "github.com/google/cadvisor/http/mux"
+	httpmux "github.com/google/cadvisor/http/mux"
 	info "github.com/google/cadvisor/info/v1"
 	"github.com/google/cadvisor/manager"
+
+	auth "github.com/abbot/go-http-auth"
+	"k8s.io/klog"
 )
 
 var pageTemplate *template.Template
@@ -58,58 +59,48 @@ type pageData struct {
 	NetworkAvailable       bool
 	FsAvailable            bool
 	CustomMetricsAvailable bool
+	SubcontainersAvailable bool
 	Root                   string
 	DockerStatus           []keyVal
 	DockerDriverStatus     []keyVal
-	DockerImages           []manager.DockerImage
+	DockerImages           []info.DockerImage
 }
 
 func init() {
+	containersHtmlTemplate, _ := Asset("pages/assets/html/containers.html")
 	pageTemplate = template.New("containersTemplate").Funcs(funcMap)
-	_, err := pageTemplate.Parse(containersHtmlTemplate)
+	_, err := pageTemplate.Parse(string(containersHtmlTemplate))
 	if err != nil {
-		glog.Fatalf("Failed to parse template: %s", err)
+		klog.Fatalf("Failed to parse template: %s", err)
 	}
 }
 
 func containerHandlerNoAuth(containerManager manager.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		err := serveContainersPage(containerManager, w, r.URL)
-		if err != nil {
-			fmt.Fprintf(w, "%s", err)
-		}
+		serveContainersPage(containerManager, w, r.URL)
 	}
 }
 
 func containerHandler(containerManager manager.Manager) auth.AuthenticatedHandlerFunc {
 	return func(w http.ResponseWriter, r *auth.AuthenticatedRequest) {
-		err := serveContainersPage(containerManager, w, r.URL)
-		if err != nil {
-			fmt.Fprintf(w, "%s", err)
-		}
+		serveContainersPage(containerManager, w, r.URL)
 	}
 }
 
 func dockerHandlerNoAuth(containerManager manager.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		err := serveDockerPage(containerManager, w, r.URL)
-		if err != nil {
-			fmt.Fprintf(w, "%s", err)
-		}
+		serveDockerPage(containerManager, w, r.URL)
 	}
 }
 
 func dockerHandler(containerManager manager.Manager) auth.AuthenticatedHandlerFunc {
 	return func(w http.ResponseWriter, r *auth.AuthenticatedRequest) {
-		err := serveDockerPage(containerManager, w, r.URL)
-		if err != nil {
-			fmt.Fprintf(w, "%s", err)
-		}
+		serveDockerPage(containerManager, w, r.URL)
 	}
 }
 
 // Register http handlers
-func RegisterHandlersDigest(mux httpMux.Mux, containerManager manager.Manager, authenticator *auth.DigestAuth) error {
+func RegisterHandlersDigest(mux httpmux.Mux, containerManager manager.Manager, authenticator *auth.DigestAuth, urlBasePrefix string) error {
 	// Register the handler for the containers page.
 	if authenticator != nil {
 		mux.HandleFunc(ContainersPage, authenticator.Wrap(containerHandler(containerManager)))
@@ -118,10 +109,20 @@ func RegisterHandlersDigest(mux httpMux.Mux, containerManager manager.Manager, a
 		mux.HandleFunc(ContainersPage, containerHandlerNoAuth(containerManager))
 		mux.HandleFunc(DockerPage, dockerHandlerNoAuth(containerManager))
 	}
+
+	if ContainersPage[len(ContainersPage)-1] == '/' {
+		redirectHandler := http.RedirectHandler(urlBasePrefix+ContainersPage, http.StatusMovedPermanently)
+		mux.Handle(ContainersPage[0:len(ContainersPage)-1], redirectHandler)
+	}
+	if DockerPage[len(DockerPage)-1] == '/' {
+		redirectHandler := http.RedirectHandler(urlBasePrefix+DockerPage, http.StatusMovedPermanently)
+		mux.Handle(DockerPage[0:len(DockerPage)-1], redirectHandler)
+	}
+
 	return nil
 }
 
-func RegisterHandlersBasic(mux httpMux.Mux, containerManager manager.Manager, authenticator *auth.BasicAuth) error {
+func RegisterHandlersBasic(mux httpmux.Mux, containerManager manager.Manager, authenticator *auth.BasicAuth, urlBasePrefix string) error {
 	// Register the handler for the containers and docker age.
 	if authenticator != nil {
 		mux.HandleFunc(ContainersPage, authenticator.Wrap(containerHandler(containerManager)))
@@ -130,6 +131,16 @@ func RegisterHandlersBasic(mux httpMux.Mux, containerManager manager.Manager, au
 		mux.HandleFunc(ContainersPage, containerHandlerNoAuth(containerManager))
 		mux.HandleFunc(DockerPage, dockerHandlerNoAuth(containerManager))
 	}
+
+	if ContainersPage[len(ContainersPage)-1] == '/' {
+		redirectHandler := http.RedirectHandler(urlBasePrefix+ContainersPage, http.StatusMovedPermanently)
+		mux.Handle(ContainersPage[0:len(ContainersPage)-1], redirectHandler)
+	}
+	if DockerPage[len(DockerPage)-1] == '/' {
+		redirectHandler := http.RedirectHandler(urlBasePrefix+DockerPage, http.StatusMovedPermanently)
+		mux.Handle(DockerPage[0:len(DockerPage)-1], redirectHandler)
+	}
+
 	return nil
 }
 

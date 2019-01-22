@@ -19,18 +19,19 @@ import (
 	"net/http"
 	"path"
 	"strconv"
-	"time"
 
-	"github.com/golang/glog"
 	info "github.com/google/cadvisor/info/v1"
 	"github.com/google/cadvisor/info/v2"
 	"github.com/google/cadvisor/manager"
+
+	"k8s.io/klog"
 )
 
 const (
 	containersApi    = "containers"
 	subcontainersApi = "subcontainers"
 	machineApi       = "machine"
+	machineStatsApi  = "machinestats"
 	dockerApi        = "docker"
 	summaryApi       = "summary"
 	statsApi         = "stats"
@@ -62,8 +63,9 @@ func getApiVersions() []ApiVersion {
 	v1_2 := newVersion1_2(v1_1)
 	v1_3 := newVersion1_3(v1_2)
 	v2_0 := newVersion2_0()
+	v2_1 := newVersion2_1(v2_0)
 
-	return []ApiVersion{v1_0, v1_1, v1_2, v1_3, v2_0}
+	return []ApiVersion{v1_0, v1_1, v1_2, v1_3, v2_0, v2_1}
 
 }
 
@@ -83,7 +85,7 @@ func (self *version1_0) SupportedRequestTypes() []string {
 func (self *version1_0) HandleRequest(requestType string, request []string, m manager.Manager, w http.ResponseWriter, r *http.Request) error {
 	switch requestType {
 	case machineApi:
-		glog.V(4).Infof("Api - Machine")
+		klog.V(4).Infof("Api - Machine")
 
 		// Get the MachineInfo
 		machineInfo, err := m.GetMachineInfo()
@@ -97,7 +99,7 @@ func (self *version1_0) HandleRequest(requestType string, request []string, m ma
 		}
 	case containersApi:
 		containerName := getContainerName(request)
-		glog.V(4).Infof("Api - Container(%s)", containerName)
+		klog.V(4).Infof("Api - Container(%s)", containerName)
 
 		// Get the query request.
 		query, err := getContainerInfoRequest(r.Body)
@@ -147,7 +149,7 @@ func (self *version1_1) HandleRequest(requestType string, request []string, m ma
 	switch requestType {
 	case subcontainersApi:
 		containerName := getContainerName(request)
-		glog.V(4).Infof("Api - Subcontainers(%s)", containerName)
+		klog.V(4).Infof("Api - Subcontainers(%s)", containerName)
 
 		// Get the query request.
 		query, err := getContainerInfoRequest(r.Body)
@@ -196,7 +198,7 @@ func (self *version1_2) SupportedRequestTypes() []string {
 func (self *version1_2) HandleRequest(requestType string, request []string, m manager.Manager, w http.ResponseWriter, r *http.Request) error {
 	switch requestType {
 	case dockerApi:
-		glog.V(4).Infof("Api - Docker(%v)", request)
+		klog.V(4).Infof("Api - Docker(%v)", request)
 
 		// Get the query request.
 		query, err := getContainerInfoRequest(r.Body)
@@ -277,7 +279,7 @@ func handleEventRequest(request []string, m manager.Manager, w http.ResponseWrit
 		return err
 	}
 	query.ContainerName = path.Join("/", getContainerName(request))
-	glog.V(4).Infof("Api - Events(%v)", query)
+	klog.V(4).Infof("Api - Events(%v)", query)
 	if !stream {
 		pastEvents, err := m.GetPastEvents(query)
 		if err != nil {
@@ -317,14 +319,14 @@ func (self *version2_0) HandleRequest(requestType string, request []string, m ma
 	}
 	switch requestType {
 	case versionApi:
-		glog.V(4).Infof("Api - Version")
+		klog.V(4).Infof("Api - Version")
 		versionInfo, err := m.GetVersionInfo()
 		if err != nil {
 			return err
 		}
 		return writeResult(versionInfo.CadvisorVersion, w)
 	case attributesApi:
-		glog.V(4).Info("Api - Attributes")
+		klog.V(4).Info("Api - Attributes")
 
 		machineInfo, err := m.GetMachineInfo()
 		if err != nil {
@@ -337,7 +339,7 @@ func (self *version2_0) HandleRequest(requestType string, request []string, m ma
 		info := v2.GetAttributes(machineInfo, versionInfo)
 		return writeResult(info, w)
 	case machineApi:
-		glog.V(4).Info("Api - Machine")
+		klog.V(4).Info("Api - Machine")
 
 		// TODO(rjnagal): Move machineInfo from v1.
 		machineInfo, err := m.GetMachineInfo()
@@ -347,7 +349,7 @@ func (self *version2_0) HandleRequest(requestType string, request []string, m ma
 		return writeResult(machineInfo, w)
 	case summaryApi:
 		containerName := getContainerName(request)
-		glog.V(4).Infof("Api - Summary for container %q, options %+v", containerName, opt)
+		klog.V(4).Infof("Api - Summary for container %q, options %+v", containerName, opt)
 
 		stats, err := m.GetDerivedStats(containerName, opt)
 		if err != nil {
@@ -356,48 +358,51 @@ func (self *version2_0) HandleRequest(requestType string, request []string, m ma
 		return writeResult(stats, w)
 	case statsApi:
 		name := getContainerName(request)
-		glog.V(4).Infof("Api - Stats: Looking for stats for container %q, options %+v", name, opt)
-		conts, err := m.GetRequestedContainersInfo(name, opt)
+		klog.V(4).Infof("Api - Stats: Looking for stats for container %q, options %+v", name, opt)
+		infos, err := m.GetRequestedContainersInfo(name, opt)
 		if err != nil {
-			return err
+			if len(infos) == 0 {
+				return err
+			}
+			klog.Errorf("Error calling GetRequestedContainersInfo: %v", err)
 		}
-		contStats := make(map[string][]v2.ContainerStats, 0)
-		for name, cont := range conts {
-			contStats[name] = convertStats(cont)
+		contStats := make(map[string][]v2.DeprecatedContainerStats, 0)
+		for name, cinfo := range infos {
+			contStats[name] = v2.DeprecatedStatsFromV1(cinfo)
 		}
 		return writeResult(contStats, w)
 	case customMetricsApi:
 		containerName := getContainerName(request)
-		glog.V(4).Infof("Api - Custom Metrics: Looking for metrics for container %q, options %+v", containerName, opt)
-		conts, err := m.GetRequestedContainersInfo(containerName, opt)
+		klog.V(4).Infof("Api - Custom Metrics: Looking for metrics for container %q, options %+v", containerName, opt)
+		infos, err := m.GetContainerInfoV2(containerName, opt)
 		if err != nil {
 			return err
 		}
 		contMetrics := make(map[string]map[string]map[string][]info.MetricValBasic, 0)
-		for _, cont := range conts {
+		for _, cinfo := range infos {
 			metrics := make(map[string]map[string][]info.MetricValBasic, 0)
-			contStats := convertStats(cont)
-			for _, contStat := range contStats {
-				if contStat.HasCustomMetrics {
-					for name, allLabels := range contStat.CustomMetrics {
-						metricLabels := make(map[string][]info.MetricValBasic, 0)
-						for _, metric := range allLabels {
-							if !metric.Timestamp.IsZero() {
-								metVal := info.MetricValBasic{
-									Timestamp:  metric.Timestamp,
-									IntValue:   metric.IntValue,
-									FloatValue: metric.FloatValue,
-								}
-								labels := metrics[name]
-								if labels != nil {
-									values := labels[metric.Label]
-									values = append(values, metVal)
-									labels[metric.Label] = values
-									metrics[name] = labels
-								} else {
-									metricLabels[metric.Label] = []info.MetricValBasic{metVal}
-									metrics[name] = metricLabels
-								}
+			for _, contStat := range cinfo.Stats {
+				if len(contStat.CustomMetrics) == 0 {
+					continue
+				}
+				for name, allLabels := range contStat.CustomMetrics {
+					metricLabels := make(map[string][]info.MetricValBasic, 0)
+					for _, metric := range allLabels {
+						if !metric.Timestamp.IsZero() {
+							metVal := info.MetricValBasic{
+								Timestamp:  metric.Timestamp,
+								IntValue:   metric.IntValue,
+								FloatValue: metric.FloatValue,
+							}
+							labels := metrics[name]
+							if labels != nil {
+								values := labels[metric.Label]
+								values = append(values, metVal)
+								labels[metric.Label] = values
+								metrics[name] = labels
+							} else {
+								metricLabels[metric.Label] = []info.MetricValBasic{metVal}
+								metrics[name] = metricLabels
 							}
 						}
 					}
@@ -408,30 +413,37 @@ func (self *version2_0) HandleRequest(requestType string, request []string, m ma
 		return writeResult(contMetrics, w)
 	case specApi:
 		containerName := getContainerName(request)
-		glog.V(4).Infof("Api - Spec for container %q, options %+v", containerName, opt)
+		klog.V(4).Infof("Api - Spec for container %q, options %+v", containerName, opt)
 		specs, err := m.GetContainerSpec(containerName, opt)
 		if err != nil {
 			return err
 		}
 		return writeResult(specs, w)
 	case storageApi:
-		var err error
-		fi := []v2.FsInfo{}
 		label := r.URL.Query().Get("label")
-		if len(label) == 0 {
-			// Get all global filesystems info.
-			fi, err = m.GetFsInfo("")
+		uuid := r.URL.Query().Get("uuid")
+		switch {
+		case uuid != "":
+			fi, err := m.GetFsInfoByFsUUID(uuid)
 			if err != nil {
 				return err
 			}
-		} else {
+			return writeResult(fi, w)
+		case label != "":
 			// Get a specific label.
-			fi, err = m.GetFsInfo(label)
+			fi, err := m.GetFsInfo(label)
 			if err != nil {
 				return err
 			}
+			return writeResult(fi, w)
+		default:
+			// Get all global filesystems info.
+			fi, err := m.GetFsInfo("")
+			if err != nil {
+				return err
+			}
+			return writeResult(fi, w)
 		}
-		return writeResult(fi, w)
 	case eventsApi:
 		return handleEventRequest(request, m, w, r)
 	case psApi:
@@ -439,7 +451,7 @@ func (self *version2_0) HandleRequest(requestType string, request []string, m ma
 		// ignore recursive.
 		// TODO(rjnagal): consider count to limit ps output.
 		name := getContainerName(request)
-		glog.V(4).Infof("Api - Spec for container %q, options %+v", name, opt)
+		klog.V(4).Infof("Api - Spec for container %q, options %+v", name, opt)
 		ps, err := m.GetProcessList(name, opt)
 		if err != nil {
 			return fmt.Errorf("process listing failed: %v", err)
@@ -450,102 +462,67 @@ func (self *version2_0) HandleRequest(requestType string, request []string, m ma
 	}
 }
 
-func instCpuStats(last, cur *info.ContainerStats) (*v2.CpuInstStats, error) {
-	if last == nil {
-		return nil, nil
-	}
-	if !cur.Timestamp.After(last.Timestamp) {
-		return nil, fmt.Errorf("container stats move backwards in time")
-	}
-	if len(last.Cpu.Usage.PerCpu) != len(cur.Cpu.Usage.PerCpu) {
-		return nil, fmt.Errorf("different number of cpus")
-	}
-	timeDelta := cur.Timestamp.Sub(last.Timestamp)
-	if timeDelta <= 100*time.Millisecond {
-		return nil, fmt.Errorf("time delta unexpectedly small")
-	}
-	// Nanoseconds to gain precision and avoid having zero seconds if the
-	// difference between the timestamps is just under a second
-	timeDeltaNs := uint64(timeDelta.Nanoseconds())
-	convertToRate := func(lastValue, curValue uint64) (uint64, error) {
-		if curValue < lastValue {
-			return 0, fmt.Errorf("cumulative stats decrease")
-		}
-		valueDelta := curValue - lastValue
-		return (valueDelta * 1e9) / timeDeltaNs, nil
-	}
-	total, err := convertToRate(last.Cpu.Usage.Total, cur.Cpu.Usage.Total)
-	if err != nil {
-		return nil, err
-	}
-	percpu := make([]uint64, len(last.Cpu.Usage.PerCpu))
-	for i := range percpu {
-		var err error
-		percpu[i], err = convertToRate(last.Cpu.Usage.PerCpu[i], cur.Cpu.Usage.PerCpu[i])
-		if err != nil {
-			return nil, err
-		}
-	}
-	user, err := convertToRate(last.Cpu.Usage.User, cur.Cpu.Usage.User)
-	if err != nil {
-		return nil, err
-	}
-	system, err := convertToRate(last.Cpu.Usage.System, cur.Cpu.Usage.System)
-	if err != nil {
-		return nil, err
-	}
-	return &v2.CpuInstStats{
-		Usage: v2.CpuInstUsage{
-			Total:  total,
-			PerCpu: percpu,
-			User:   user,
-			System: system,
-		},
-	}, nil
+type version2_1 struct {
+	baseVersion *version2_0
 }
 
-func convertStats(cont *info.ContainerInfo) []v2.ContainerStats {
-	stats := make([]v2.ContainerStats, 0, len(cont.Stats))
-	var last *info.ContainerStats
-	for _, val := range cont.Stats {
-		stat := v2.ContainerStats{
-			Timestamp:        val.Timestamp,
-			HasCpu:           cont.Spec.HasCpu,
-			HasMemory:        cont.Spec.HasMemory,
-			HasNetwork:       cont.Spec.HasNetwork,
-			HasFilesystem:    cont.Spec.HasFilesystem,
-			HasDiskIo:        cont.Spec.HasDiskIo,
-			HasCustomMetrics: cont.Spec.HasCustomMetrics,
-		}
-		if stat.HasCpu {
-			stat.Cpu = val.Cpu
-			cpuInst, err := instCpuStats(last, val)
-			if err != nil {
-				glog.Warningf("Could not get instant cpu stats: %v", err)
-			} else {
-				stat.CpuInst = cpuInst
-			}
-			last = val
-		}
-		if stat.HasMemory {
-			stat.Memory = val.Memory
-		}
-		if stat.HasNetwork {
-			stat.Network.Interfaces = val.Network.Interfaces
-		}
-		if stat.HasFilesystem {
-			stat.Filesystem = val.Filesystem
-		}
-		if stat.HasDiskIo {
-			stat.DiskIo = val.DiskIo
-		}
-		if stat.HasCustomMetrics {
-			stat.CustomMetrics = val.CustomMetrics
-		}
-		// TODO(rjnagal): Handle load stats.
-		stats = append(stats, stat)
+func newVersion2_1(v *version2_0) *version2_1 {
+	return &version2_1{
+		baseVersion: v,
 	}
-	return stats
+}
+
+func (self *version2_1) Version() string {
+	return "v2.1"
+}
+
+func (self *version2_1) SupportedRequestTypes() []string {
+	return append([]string{machineStatsApi}, self.baseVersion.SupportedRequestTypes()...)
+}
+
+func (self *version2_1) HandleRequest(requestType string, request []string, m manager.Manager, w http.ResponseWriter, r *http.Request) error {
+	// Get the query request.
+	opt, err := getRequestOptions(r)
+	if err != nil {
+		return err
+	}
+
+	switch requestType {
+	case machineStatsApi:
+		klog.V(4).Infof("Api - MachineStats(%v)", request)
+		cont, err := m.GetRequestedContainersInfo("/", opt)
+		if err != nil {
+			if len(cont) == 0 {
+				return err
+			}
+			klog.Errorf("Error calling GetRequestedContainersInfo: %v", err)
+		}
+		return writeResult(v2.MachineStatsFromV1(cont["/"]), w)
+	case statsApi:
+		name := getContainerName(request)
+		klog.V(4).Infof("Api - Stats: Looking for stats for container %q, options %+v", name, opt)
+		conts, err := m.GetRequestedContainersInfo(name, opt)
+		if err != nil {
+			if len(conts) == 0 {
+				return err
+			}
+			klog.Errorf("Error calling GetRequestedContainersInfo: %v", err)
+		}
+		contStats := make(map[string]v2.ContainerInfo, len(conts))
+		for name, cont := range conts {
+			if name == "/" {
+				// Root cgroup stats should be exposed as machine stats
+				continue
+			}
+			contStats[name] = v2.ContainerInfo{
+				Spec:  v2.ContainerSpecFromV1(&cont.Spec, cont.Aliases, cont.Namespace),
+				Stats: v2.ContainerStatsFromV1(name, &cont.Spec, cont.Stats),
+			}
+		}
+		return writeResult(contStats, w)
+	default:
+		return self.baseVersion.HandleRequest(requestType, request, m, w, r)
+	}
 }
 
 func getRequestOptions(r *http.Request) (v2.RequestOptions, error) {

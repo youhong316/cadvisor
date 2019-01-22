@@ -77,17 +77,6 @@ func TimeEq(t1, t2 time.Time, tolerance time.Duration) bool {
 	return false
 }
 
-func durationEq(a, b time.Duration, tolerance time.Duration) bool {
-	if a > b {
-		a, b = b, a
-	}
-	diff := a - b
-	if diff <= tolerance {
-		return true
-	}
-	return false
-}
-
 const (
 	// 10ms, i.e. 0.01s
 	timePrecision time.Duration = 10 * time.Millisecond
@@ -134,14 +123,16 @@ func StorageDriverFillRandomStatsFunc(
 
 	samplePeriod := 1 * time.Second
 
-	ref := info.ContainerReference{
-		Name: containerName,
+	cInfo := info.ContainerInfo{
+		ContainerReference: info.ContainerReference{
+			Name: containerName,
+		},
 	}
 
 	trace := buildTrace(cpuTrace, memTrace, samplePeriod)
 
 	for _, stats := range trace {
-		err := driver.AddStats(ref, stats)
+		err := driver.AddStats(&cInfo, stats)
 		if err != nil {
 			t.Fatalf("unable to add stats: %v", err)
 		}

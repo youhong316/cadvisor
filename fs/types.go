@@ -14,18 +14,38 @@
 
 package fs
 
+import (
+	"errors"
+	"time"
+)
+
 type DeviceInfo struct {
 	Device string
 	Major  uint
 	Minor  uint
 }
 
+type FsType string
+
+func (ft FsType) String() string {
+	return string(ft)
+}
+
+const (
+	ZFS          FsType = "zfs"
+	DeviceMapper FsType = "devicemapper"
+	VFS          FsType = "vfs"
+)
+
 type Fs struct {
 	DeviceInfo
-	Capacity  uint64
-	Free      uint64
-	Available uint64
-	DiskStats DiskStats
+	Type       FsType
+	Capacity   uint64
+	Free       uint64
+	Available  uint64
+	Inodes     *uint64
+	InodesFree *uint64
+	DiskStats  DiskStats
 }
 
 type DiskStats struct {
@@ -42,6 +62,9 @@ type DiskStats struct {
 	WeightedIoTime  uint64
 }
 
+// ErrNoSuchDevice is the error indicating the requested device does not exist.
+var ErrNoSuchDevice = errors.New("cadvisor: no such device")
+
 type FsInfo interface {
 	// Returns capacity and free space, in bytes, of all the ext2, ext3, ext4 filesystems on the host.
 	GetGlobalFsInfo() ([]Fs, error)
@@ -50,7 +73,15 @@ type FsInfo interface {
 	GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, error)
 
 	// Returns number of bytes occupied by 'dir'.
-	GetDirUsage(dir string) (uint64, error)
+	GetDirDiskUsage(dir string, timeout time.Duration) (uint64, error)
+
+	// Returns number of inodes used by 'dir'.
+	GetDirInodeUsage(dir string, timeout time.Duration) (uint64, error)
+
+	// GetDeviceInfoByFsUUID returns the information of the device with the
+	// specified filesystem uuid. If no such device exists, this function will
+	// return the ErrNoSuchDevice error.
+	GetDeviceInfoByFsUUID(uuid string) (*DeviceInfo, error)
 
 	// Returns the block device info of the filesystem on which 'dir' resides.
 	GetDirFsDevice(dir string) (*DeviceInfo, error)

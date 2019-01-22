@@ -17,119 +17,36 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
+	"strings"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/cadvisor/cache/memory"
 	"github.com/google/cadvisor/storage"
-	"github.com/google/cadvisor/storage/bigquery"
-	"github.com/google/cadvisor/storage/elasticsearch"
-	"github.com/google/cadvisor/storage/influxdb"
-	"github.com/google/cadvisor/storage/redis"
-	"github.com/google/cadvisor/storage/statsd"
-	"github.com/google/cadvisor/storage/stdout"
+	_ "github.com/google/cadvisor/storage/bigquery"
+	_ "github.com/google/cadvisor/storage/elasticsearch"
+	_ "github.com/google/cadvisor/storage/influxdb"
+	_ "github.com/google/cadvisor/storage/kafka"
+	_ "github.com/google/cadvisor/storage/redis"
+	_ "github.com/google/cadvisor/storage/statsd"
+	_ "github.com/google/cadvisor/storage/stdout"
+
+	"k8s.io/klog"
 )
 
-var argDbUsername = flag.String("storage_driver_user", "root", "database username")
-var argDbPassword = flag.String("storage_driver_password", "root", "database password")
-var argDbHost = flag.String("storage_driver_host", "localhost:8086", "database host:port")
-var argDbName = flag.String("storage_driver_db", "cadvisor", "database name")
-var argDbTable = flag.String("storage_driver_table", "stats", "table name")
-var argDbIsSecure = flag.Bool("storage_driver_secure", false, "use secure connection with database")
-var argDbBufferDuration = flag.Duration("storage_driver_buffer_duration", 60*time.Second, "Writes in the storage driver will be buffered for this duration, and committed to the non memory backends as a single transaction")
-var storageDuration = flag.Duration("storage_duration", 2*time.Minute, "How long to keep data stored (Default: 2min).")
-var argElasticHost = flag.String("storage_driver_es_host", "http://localhost:9200", "database host:port")
-var argIndexName = flag.String("storage_driver_index", "cadvisor", "index name")
-var argTypeName = flag.String("storage_driver_type", "stats", "type name")
+var (
+	storageDriver   = flag.String("storage_driver", "", fmt.Sprintf("Storage `driver` to use. Data is always cached shortly in memory, this controls where data is pushed besides the local cache. Empty means none. Options are: <empty>, %s", strings.Join(storage.ListDrivers(), ", ")))
+	storageDuration = flag.Duration("storage_duration", 2*time.Minute, "How long to keep data stored (Default: 2min).")
+)
 
-// Creates a memory storage with an optional backend storage option.
-func NewMemoryStorage(backendStorageName string) (*memory.InMemoryCache, error) {
-	var storageDriver *memory.InMemoryCache
-	var backendStorage storage.StorageDriver
-	var err error
-	switch backendStorageName {
-	case "":
-		backendStorage = nil
-	case "influxdb":
-		var hostname string
-		hostname, err = os.Hostname()
-		if err != nil {
-			return nil, err
-		}
-
-		backendStorage, err = influxdb.New(
-			hostname,
-			*argDbTable,
-			*argDbName,
-			*argDbUsername,
-			*argDbPassword,
-			*argDbHost,
-			*argDbIsSecure,
-			*argDbBufferDuration,
-		)
-	case "bigquery":
-		var hostname string
-		hostname, err = os.Hostname()
-		if err != nil {
-			return nil, err
-		}
-		backendStorage, err = bigquery.New(
-			hostname,
-			*argDbTable,
-			*argDbName,
-		)
-	case "redis":
-		//machineName: We use os.Hostname as the machineName (A unique identifier to identify the host that runs the current cAdvisor)
-		//argDbName: the key for redis's data
-		//argDbHost: the redis's server host
-		var machineName string
-		machineName, err = os.Hostname()
-		if err != nil {
-			return nil, err
-		}
-		backendStorage, err = redis.New(
-			machineName,
-			*argDbName,
-			*argDbHost,
-			*argDbBufferDuration,
-		)
-	case "elasticsearch":
-		//argIndexName: the index for elasticsearch
-		//argTypeName: the type for index
-		//argElasticHost: the elasticsearch's server host
-		var machineName string
-		machineName, err = os.Hostname()
-		if err != nil {
-			return nil, err
-		}
-		backendStorage, err = elasticsearch.New(
-			machineName,
-			*argIndexName,
-			*argTypeName,
-			*argElasticHost,
-		)
-	case "statsd":
-		backendStorage, err = statsd.New(
-			*argDbName,
-			*argDbHost,
-		)
-	case "stdout":
-		backendStorage, err = stdout.New(
-			*argDbHost,
-		)
-	default:
-		err = fmt.Errorf("unknown backend storage driver: %v", *argDbDriver)
-	}
+// NewMemoryStorage creates a memory storage with an optional backend storage option.
+func NewMemoryStorage() (*memory.InMemoryCache, error) {
+	backendStorage, err := storage.New(*storageDriver)
 	if err != nil {
 		return nil, err
 	}
-	if backendStorageName != "" {
-		glog.Infof("Using backend storage type %q", backendStorageName)
-	} else {
-		glog.Infof("No backend storage selected")
+	if *storageDriver != "" {
+		klog.V(1).Infof("Using backend storage type %q", *storageDriver)
 	}
-	glog.Infof("Caching stats in memory for %v", *storageDuration)
-	storageDriver = memory.New(*storageDuration, backendStorage)
-	return storageDriver, nil
+	klog.V(1).Infof("Caching stats in memory for %v", *storageDuration)
+	return memory.New(*storageDuration, backendStorage), nil
 }

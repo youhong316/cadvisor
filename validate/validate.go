@@ -19,17 +19,18 @@ package validate
 
 import (
 	"fmt"
-	"github.com/google/cadvisor/manager"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"path"
 	"strings"
 
-	"github.com/docker/libcontainer/cgroups"
-	dclient "github.com/fsouza/go-dockerclient"
 	"github.com/google/cadvisor/container/docker"
+	"github.com/google/cadvisor/manager"
 	"github.com/google/cadvisor/utils"
+
+	"github.com/opencontainers/runc/libcontainer/cgroups"
 )
 
 const (
@@ -133,6 +134,23 @@ func areCgroupsPresent(available map[string]int, desired []string) (bool, string
 	return true, ""
 }
 
+func validateCpuCfsBandwidth(available_cgroups map[string]int) string {
+	ok, _ := areCgroupsPresent(available_cgroups, []string{"cpu"})
+	if !ok {
+		return "\tCpu cfs bandwidth status unknown: cpu cgroup not enabled.\n"
+	}
+	mnt, err := cgroups.FindCgroupMountpoint("cpu")
+	if err != nil {
+		return "\tCpu cfs bandwidth status unknown: cpu cgroup not mounted.\n"
+	}
+	_, err = os.Stat(path.Join(mnt, "cpu.cfs_period_us"))
+	if os.IsNotExist(err) {
+		return "\tCpu cfs bandwidth is disabled. Recompile kernel with \"CONFIG_CFS_BANDWIDTH\" enabled.\n"
+	}
+
+	return "\tCpu cfs bandwidth is enabled.\n"
+}
+
 func validateMemoryAccounting(available_cgroups map[string]int) string {
 	ok, _ := areCgroupsPresent(available_cgroups, []string{"memory"})
 	if !ok {
@@ -181,37 +199,18 @@ func validateCgroups() (string, string) {
 	out = fmt.Sprintf("Available cgroups: %v\n", available_cgroups)
 	out += desc
 	out += validateMemoryAccounting(available_cgroups)
+	out += validateCpuCfsBandwidth(available_cgroups)
 	return Recommended, out
 }
 
 func validateDockerInfo() (string, string) {
-	client, err := dclient.NewClient(*docker.ArgDockerEndpoint)
-	if err == nil {
-		info, err := client.Info()
-		if err == nil {
-			execDriver := info.Get("ExecutionDriver")
-			storageDriver := info.Get("Driver")
-			desc := fmt.Sprintf("Docker exec driver is %s. Storage driver is %s.\n", execDriver, storageDriver)
-			if docker.UseSystemd() {
-				desc += "\tsystemd is being used to create cgroups.\n"
-			} else {
-				desc += "\tCgroups are being created through cgroup filesystem.\n"
-			}
-			if strings.Contains(execDriver, "native") {
-				stateFile := docker.DockerStateDir()
-				if !utils.FileExists(stateFile) {
-					desc += fmt.Sprintf("\tDocker container state directory %q is not accessible.\n", stateFile)
-					return Unsupported, desc
-				}
-				desc += fmt.Sprintf("\tDocker container state directory is at %q and is accessible.\n", stateFile)
-				return Recommended, desc
-			} else if strings.Contains(execDriver, "lxc") {
-				return Supported, desc
-			}
-			return Unknown, desc
-		}
+	info, err := docker.ValidateInfo()
+	if err != nil {
+		return Unsupported, fmt.Sprintf("Docker setup is invalid: %v", err)
 	}
-	return Unknown, "Docker remote API not reachable\n\t"
+
+	desc := fmt.Sprintf("Storage driver is %s.\n", info.Driver)
+	return Recommended, desc
 }
 
 func validateCgroupMounts() (string, string) {

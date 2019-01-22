@@ -28,18 +28,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/cadvisor/events"
-	httpMux "github.com/google/cadvisor/http/mux"
+	httpmux "github.com/google/cadvisor/http/mux"
 	info "github.com/google/cadvisor/info/v1"
 	"github.com/google/cadvisor/manager"
+
+	"k8s.io/klog"
 )
 
 const (
 	apiResource = "/api/"
 )
 
-func RegisterHandlers(mux httpMux.Mux, m manager.Manager) error {
+func RegisterHandlers(mux httpmux.Mux, m manager.Manager) error {
 	apiVersions := getApiVersions()
 	supportedApiVersions := make(map[string]ApiVersion, len(apiVersions))
 	for _, v := range apiVersions {
@@ -56,7 +57,7 @@ func RegisterHandlers(mux httpMux.Mux, m manager.Manager) error {
 }
 
 // Captures the API version, requestType [optional], and remaining request [optional].
-var apiRegexp = regexp.MustCompile("/api/([^/]+)/?([^/]+)?(.*)")
+var apiRegexp = regexp.MustCompile(`/api/([^/]+)/?([^/]+)?(.*)`)
 
 const (
 	apiVersion = iota + 1
@@ -67,7 +68,7 @@ const (
 func handleRequest(supportedApiVersions map[string]ApiVersion, m manager.Manager, w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
 	defer func() {
-		glog.V(4).Infof("Request took %s", time.Since(start))
+		klog.V(4).Infof("Request took %s", time.Since(start))
 	}()
 
 	request := r.URL.Path
@@ -84,7 +85,7 @@ func handleRequest(supportedApiVersions map[string]ApiVersion, m manager.Manager
 			versions = append(versions, v)
 		}
 		sort.Strings(versions)
-		fmt.Fprintf(w, "Supported API versions: %s", strings.Join(versions, ","))
+		http.Error(w, fmt.Sprintf("Supported API versions: %s", strings.Join(versions, ",")), http.StatusBadRequest)
 		return nil
 	}
 
@@ -108,7 +109,7 @@ func handleRequest(supportedApiVersions map[string]ApiVersion, m manager.Manager
 	if requestType == "" {
 		requestTypes := versionHandler.SupportedRequestTypes()
 		sort.Strings(requestTypes)
-		fmt.Fprintf(w, "Supported request types: %q", strings.Join(requestTypes, ","))
+		http.Error(w, fmt.Sprintf("Supported request types: %q", strings.Join(requestTypes, ",")), http.StatusBadRequest)
 		return nil
 	}
 
@@ -156,7 +157,7 @@ func streamResults(eventChannel *events.EventChannel, w http.ResponseWriter, r *
 		case ev := <-eventChannel.GetChannel():
 			err := enc.Encode(ev)
 			if err != nil {
-				glog.Errorf("error encoding message %+v for result stream: %v", ev, err)
+				klog.Errorf("error encoding message %+v for result stream: %v", ev, err)
 			}
 			flusher.Flush()
 		}

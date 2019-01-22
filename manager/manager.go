@@ -18,35 +18,51 @@ package manager
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/docker/libcontainer/cgroups"
-	"github.com/golang/glog"
+	"github.com/google/cadvisor/accelerators"
 	"github.com/google/cadvisor/cache/memory"
 	"github.com/google/cadvisor/collector"
 	"github.com/google/cadvisor/container"
+	"github.com/google/cadvisor/container/containerd"
+	"github.com/google/cadvisor/container/crio"
 	"github.com/google/cadvisor/container/docker"
+	"github.com/google/cadvisor/container/mesos"
 	"github.com/google/cadvisor/container/raw"
+	"github.com/google/cadvisor/container/rkt"
+	"github.com/google/cadvisor/container/systemd"
 	"github.com/google/cadvisor/events"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
 	"github.com/google/cadvisor/info/v2"
-	"github.com/google/cadvisor/utils/cpuload"
+	"github.com/google/cadvisor/machine"
+	"github.com/google/cadvisor/manager/watcher"
+	rawwatcher "github.com/google/cadvisor/manager/watcher/raw"
+	rktwatcher "github.com/google/cadvisor/manager/watcher/rkt"
 	"github.com/google/cadvisor/utils/oomparser"
 	"github.com/google/cadvisor/utils/sysfs"
+	"github.com/google/cadvisor/version"
+
+	"github.com/opencontainers/runc/libcontainer/cgroups"
+	"golang.org/x/net/context"
+	"k8s.io/klog"
+	"k8s.io/utils/clock"
 )
 
 var globalHousekeepingInterval = flag.Duration("global_housekeeping_interval", 1*time.Minute, "Interval between global housekeepings")
+var updateMachineInfoInterval = flag.Duration("update_machine_info_interval", 5*time.Minute, "Interval between machine info updates.")
 var logCadvisorUsage = flag.Bool("log_cadvisor_usage", false, "Whether to log the usage of the cAdvisor container")
-var enableLoadReader = flag.Bool("enable_load_reader", false, "Whether to enable cpu load reader")
 var eventStorageAgeLimit = flag.String("event_storage_age_limit", "default=24h", "Max length of time for which to store events (per type). Value is a comma separated list of key values, where the keys are event types (e.g.: creation, oom) or \"default\" and the value is a duration. Default is applied to all non-specified event types")
 var eventStorageEventLimit = flag.String("event_storage_event_limit", "default=100000", "Max number of events to store (per type). Value is a comma separated list of key values, where the keys are event types (e.g.: creation, oom) or \"default\" and the value is an integer. Default is applied to all non-specified event types")
+var applicationMetricsCountLimit = flag.Int("application_metrics_count_limit", 100, "Max number of application metrics to store (per container)")
+
+const dockerClientTimeout = 10 * time.Second
 
 // The Manager interface defines operations for starting a manager and getting
 // container and machine information.
@@ -58,8 +74,13 @@ type Manager interface {
 	// Stops the manager.
 	Stop() error
 
-	// Get information about a container.
+	//  information about a container.
 	GetContainerInfo(containerName string, query *info.ContainerInfoRequest) (*info.ContainerInfo, error)
+
+	// Get V2 information about a container.
+	// Recursive (subcontainer) requests are best-effort, and may return a partial result alongside an
+	// error in the partial failure case.
+	GetContainerInfoV2(containerName string, options v2.RequestOptions) (map[string]v2.ContainerInfo, error)
 
 	// Get information about all subcontainers of the specified container (includes self).
 	SubcontainersInfo(containerName string, query *info.ContainerInfoRequest) ([]*info.ContainerInfo, error)
@@ -88,6 +109,14 @@ type Manager interface {
 	// Get version information about different components we depend on.
 	GetVersionInfo() (*info.VersionInfo, error)
 
+	// GetFsInfoByFsUUID returns the information of the device having the
+	// specified filesystem uuid. If no such device with the UUID exists, this
+	// function will return the fs.ErrNoSuchDevice error.
+	GetFsInfoByFsUUID(uuid string) (v2.FsInfo, error)
+
+	// Get filesystem information for the filesystem that contains the given directory
+	GetDirFsInfo(dir string) (v2.FsInfo, error)
+
 	// Get filesystem information for a given label.
 	// Returns information for all global filesystems if label is empty.
 	GetFsInfo(label string) ([]v2.FsInfo, error)
@@ -104,29 +133,62 @@ type Manager interface {
 	CloseEventChannel(watch_id int)
 
 	// Get status information about docker.
-	DockerInfo() (DockerStatus, error)
+	DockerInfo() (info.DockerStatus, error)
 
 	// Get details about interesting docker images.
-	DockerImages() ([]DockerImage, error)
+	DockerImages() ([]info.DockerImage, error)
 
 	// Returns debugging information. Map of lines per category.
 	DebugInfo() map[string][]string
 }
 
 // New takes a memory storage and returns a new manager.
-func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingInterval time.Duration, allowDynamicHousekeeping bool) (Manager, error) {
+func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingInterval time.Duration, allowDynamicHousekeeping bool, includedMetricsSet container.MetricSet, collectorHttpClient *http.Client, rawContainerCgroupPathPrefixWhiteList []string) (Manager, error) {
 	if memoryCache == nil {
 		return nil, fmt.Errorf("manager requires memory storage")
 	}
 
 	// Detect the container we are running on.
-	selfContainer, err := cgroups.GetThisCgroupDir("cpu")
+	selfContainer, err := cgroups.GetOwnCgroupPath("cpu")
 	if err != nil {
 		return nil, err
 	}
-	glog.Infof("cAdvisor running in container: %q", selfContainer)
+	klog.V(2).Infof("cAdvisor running in container: %q", selfContainer)
 
-	context := fs.Context{DockerRoot: docker.RootDir()}
+	var (
+		dockerStatus info.DockerStatus
+		rktPath      string
+	)
+	docker.SetTimeout(dockerClientTimeout)
+	// Try to connect to docker indefinitely on startup.
+	dockerStatus = retryDockerStatus()
+
+	if tmpRktPath, err := rkt.RktPath(); err != nil {
+		klog.V(5).Infof("Rkt not connected: %v", err)
+	} else {
+		rktPath = tmpRktPath
+	}
+
+	crioClient, err := crio.Client()
+	if err != nil {
+		return nil, err
+	}
+	crioInfo, err := crioClient.Info()
+	if err != nil {
+		klog.V(5).Infof("CRI-O not connected: %v", err)
+	}
+
+	context := fs.Context{
+		Docker: fs.DockerContext{
+			Root:         docker.RootDir(),
+			Driver:       dockerStatus.Driver,
+			DriverStatus: dockerStatus.DriverStatus,
+		},
+		RktPath: rktPath,
+		Crio: fs.CrioContext{
+			Root: crioInfo.StorageRoot,
+		},
+	}
 	fsInfo, err := fs.NewFsInfo(context)
 	if err != nil {
 		return nil, err
@@ -138,33 +200,69 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingIn
 	if _, err := os.Stat("/rootfs/proc"); os.IsNotExist(err) {
 		inHostNamespace = true
 	}
+
+	// Register for new subcontainers.
+	eventsChannel := make(chan watcher.ContainerEvent, 16)
+
 	newManager := &manager{
-		containers:               make(map[namespacedContainerName]*containerData),
-		quitChannels:             make([]chan error, 0, 2),
-		memoryCache:              memoryCache,
-		fsInfo:                   fsInfo,
-		cadvisorContainer:        selfContainer,
-		inHostNamespace:          inHostNamespace,
-		startupTime:              time.Now(),
-		maxHousekeepingInterval:  maxHousekeepingInterval,
-		allowDynamicHousekeeping: allowDynamicHousekeeping,
+		containers:                            make(map[namespacedContainerName]*containerData),
+		quitChannels:                          make([]chan error, 0, 2),
+		memoryCache:                           memoryCache,
+		fsInfo:                                fsInfo,
+		sysFs:                                 sysfs,
+		cadvisorContainer:                     selfContainer,
+		inHostNamespace:                       inHostNamespace,
+		startupTime:                           time.Now(),
+		maxHousekeepingInterval:               maxHousekeepingInterval,
+		allowDynamicHousekeeping:              allowDynamicHousekeeping,
+		includedMetrics:                       includedMetricsSet,
+		containerWatchers:                     []watcher.ContainerWatcher{},
+		eventsChannel:                         eventsChannel,
+		collectorHttpClient:                   collectorHttpClient,
+		nvidiaManager:                         &accelerators.NvidiaManager{},
+		rawContainerCgroupPathPrefixWhiteList: rawContainerCgroupPathPrefixWhiteList,
 	}
 
-	machineInfo, err := getMachineInfo(sysfs, fsInfo)
+	machineInfo, err := machine.Info(sysfs, fsInfo, inHostNamespace)
 	if err != nil {
 		return nil, err
 	}
 	newManager.machineInfo = *machineInfo
-	glog.Infof("Machine: %+v", newManager.machineInfo)
+	klog.V(1).Infof("Machine: %+v", newManager.machineInfo)
 
 	versionInfo, err := getVersionInfo()
 	if err != nil {
 		return nil, err
 	}
-	glog.Infof("Version: %+v", *versionInfo)
+	klog.V(1).Infof("Version: %+v", *versionInfo)
 
 	newManager.eventHandler = events.NewEventManager(parseEventsStoragePolicy())
 	return newManager, nil
+}
+
+func retryDockerStatus() info.DockerStatus {
+	startupTimeout := dockerClientTimeout
+	maxTimeout := 4 * startupTimeout
+	for {
+		ctx, _ := context.WithTimeout(context.Background(), startupTimeout)
+		dockerStatus, err := docker.StatusWithContext(ctx)
+		if err == nil {
+			return dockerStatus
+		}
+
+		switch err {
+		case context.DeadlineExceeded:
+			klog.Warningf("Timeout trying to communicate with docker during initialization, will retry")
+		default:
+			klog.V(5).Infof("Docker not connected: %v", err)
+			return info.DockerStatus{}
+		}
+
+		startupTimeout = 2 * startupTimeout
+		if startupTimeout > maxTimeout {
+			startupTimeout = maxTimeout
+		}
+	}
 }
 
 // A namespaced container name.
@@ -181,55 +279,78 @@ type manager struct {
 	containersLock           sync.RWMutex
 	memoryCache              *memory.InMemoryCache
 	fsInfo                   fs.FsInfo
+	sysFs                    sysfs.SysFs
+	machineMu                sync.RWMutex // protects machineInfo
 	machineInfo              info.MachineInfo
 	quitChannels             []chan error
 	cadvisorContainer        string
 	inHostNamespace          bool
-	dockerContainersRegexp   *regexp.Regexp
-	loadReader               cpuload.CpuLoadReader
 	eventHandler             events.EventManager
 	startupTime              time.Time
 	maxHousekeepingInterval  time.Duration
 	allowDynamicHousekeeping bool
+	includedMetrics          container.MetricSet
+	containerWatchers        []watcher.ContainerWatcher
+	eventsChannel            chan watcher.ContainerEvent
+	collectorHttpClient      *http.Client
+	nvidiaManager            accelerators.AcceleratorManager
+	// List of raw container cgroup path prefix whitelist.
+	rawContainerCgroupPathPrefixWhiteList []string
 }
 
 // Start the container manager.
 func (self *manager) Start() error {
-	// Register Docker container factory.
-	err := docker.Register(self, self.fsInfo)
+	err := docker.Register(self, self.fsInfo, self.includedMetrics)
 	if err != nil {
-		glog.Errorf("Docker container factory registration failed: %v.", err)
+		klog.V(5).Infof("Registration of the Docker container factory failed: %v.", err)
 	}
 
-	// Register the raw driver.
-	err = raw.Register(self, self.fsInfo)
+	err = rkt.Register(self, self.fsInfo, self.includedMetrics)
 	if err != nil {
-		glog.Errorf("Registration of the raw container factory failed: %v", err)
-	}
-
-	self.DockerInfo()
-	self.DockerImages()
-
-	if *enableLoadReader {
-		// Create cpu load reader.
-		cpuLoadReader, err := cpuload.New()
+		klog.V(5).Infof("Registration of the rkt container factory failed: %v", err)
+	} else {
+		watcher, err := rktwatcher.NewRktContainerWatcher()
 		if err != nil {
-			// TODO(rjnagal): Promote to warning once we support cpu load inside namespaces.
-			glog.Infof("Could not initialize cpu load reader: %s", err)
-		} else {
-			err = cpuLoadReader.Start()
-			if err != nil {
-				glog.Warningf("Could not start cpu load stat collector: %s", err)
-			} else {
-				self.loadReader = cpuLoadReader
-			}
+			return err
 		}
+		self.containerWatchers = append(self.containerWatchers, watcher)
 	}
+
+	err = containerd.Register(self, self.fsInfo, self.includedMetrics)
+	if err != nil {
+		klog.V(5).Infof("Registration of the containerd container factory failed: %v", err)
+	}
+
+	err = crio.Register(self, self.fsInfo, self.includedMetrics)
+	if err != nil {
+		klog.V(5).Infof("Registration of the crio container factory failed: %v", err)
+	}
+
+	err = mesos.Register(self, self.fsInfo, self.includedMetrics)
+	if err != nil {
+		klog.V(5).Infof("Registration of the mesos container factory failed: %v", err)
+	}
+
+	err = systemd.Register(self, self.fsInfo, self.includedMetrics)
+	if err != nil {
+		klog.V(5).Infof("Registration of the systemd container factory failed: %v", err)
+	}
+
+	err = raw.Register(self, self.fsInfo, self.includedMetrics, self.rawContainerCgroupPathPrefixWhiteList)
+	if err != nil {
+		klog.Errorf("Registration of the raw container factory failed: %v", err)
+	}
+
+	rawWatcher, err := rawwatcher.NewRawContainerWatcher()
+	if err != nil {
+		return err
+	}
+	self.containerWatchers = append(self.containerWatchers, rawWatcher)
 
 	// Watch for OOMs.
 	err = self.watchForNewOoms()
 	if err != nil {
-		glog.Warningf("Could not configure a source for OOM detection, disabling OOM events: %v", err)
+		klog.Warningf("Could not configure a source for OOM detection, disabling OOM events: %v", err)
 	}
 
 	// If there are no factories, don't start any housekeeping and serve the information we do have.
@@ -237,17 +358,20 @@ func (self *manager) Start() error {
 		return nil
 	}
 
+	// Setup collection of nvidia GPU metrics if any of them are attached to the machine.
+	self.nvidiaManager.Setup()
+
 	// Create root and then recover all containers.
-	err = self.createContainer("/")
+	err = self.createContainer("/", watcher.Raw)
 	if err != nil {
 		return err
 	}
-	glog.Infof("Starting recovery of all containers")
+	klog.V(2).Infof("Starting recovery of all containers")
 	err = self.detectSubcontainers("/")
 	if err != nil {
 		return err
 	}
-	glog.Infof("Recovery completed")
+	klog.V(2).Infof("Recovery completed")
 
 	// Watch for new container.
 	quitWatcher := make(chan error)
@@ -262,10 +386,15 @@ func (self *manager) Start() error {
 	self.quitChannels = append(self.quitChannels, quitGlobalHousekeeping)
 	go self.globalHousekeeping(quitGlobalHousekeeping)
 
+	quitUpdateMachineInfo := make(chan error)
+	self.quitChannels = append(self.quitChannels, quitUpdateMachineInfo)
+	go self.updateMachineInfo(quitUpdateMachineInfo)
+
 	return nil
 }
 
 func (self *manager) Stop() error {
+	defer self.nvidiaManager.Destroy()
 	// Stop and wait on all quit channels.
 	for i, c := range self.quitChannels {
 		// Send the exit signal and wait on the thread to exit (by closing the channel).
@@ -278,11 +407,29 @@ func (self *manager) Stop() error {
 		}
 	}
 	self.quitChannels = make([]chan error, 0, 2)
-	if self.loadReader != nil {
-		self.loadReader.Stop()
-		self.loadReader = nil
-	}
 	return nil
+}
+
+func (self *manager) updateMachineInfo(quit chan error) {
+	ticker := time.NewTicker(*updateMachineInfoInterval)
+	for {
+		select {
+		case <-ticker.C:
+			info, err := machine.Info(self.sysFs, self.fsInfo, self.inHostNamespace)
+			if err != nil {
+				klog.Errorf("Could not get machine info: %v", err)
+				break
+			}
+			self.machineMu.Lock()
+			self.machineInfo = *info
+			self.machineMu.Unlock()
+			klog.V(5).Infof("Update machine info: %+v", *info)
+		case <-quit:
+			ticker.Stop()
+			quit <- nil
+			return
+		}
+	}
 }
 
 func (self *manager) globalHousekeeping(quit chan error) {
@@ -301,18 +448,18 @@ func (self *manager) globalHousekeeping(quit chan error) {
 			// Check for new containers.
 			err := self.detectSubcontainers("/")
 			if err != nil {
-				glog.Errorf("Failed to detect containers: %s", err)
+				klog.Errorf("Failed to detect containers: %s", err)
 			}
 
 			// Log if housekeeping took too long.
 			duration := time.Since(start)
 			if duration >= longHousekeeping {
-				glog.V(3).Infof("Global Housekeeping(%d) took %s", t.Unix(), duration)
+				klog.V(3).Infof("Global Housekeeping(%d) took %s", t.Unix(), duration)
 			}
 		case <-quit:
 			// Quit if asked to do so.
 			quit <- nil
-			glog.Infof("Exiting global housekeeping thread")
+			klog.Infof("Exiting global housekeeping thread")
 			return
 		}
 	}
@@ -341,15 +488,16 @@ func (self *manager) GetDerivedStats(containerName string, options v2.RequestOpt
 	if err != nil {
 		return nil, err
 	}
+	var errs partialFailure
 	stats := make(map[string]v2.DerivedStats)
 	for name, cont := range conts {
 		d, err := cont.DerivedStats()
 		if err != nil {
-			return nil, err
+			errs.append(name, "DerivedStats", err)
 		}
 		stats[name] = d
 	}
-	return stats, nil
+	return stats, errs.OrNil()
 }
 
 func (self *manager) GetContainerSpec(containerName string, options v2.RequestOptions) (map[string]v2.ContainerSpec, error) {
@@ -357,47 +505,23 @@ func (self *manager) GetContainerSpec(containerName string, options v2.RequestOp
 	if err != nil {
 		return nil, err
 	}
+	var errs partialFailure
 	specs := make(map[string]v2.ContainerSpec)
 	for name, cont := range conts {
-		cinfo, err := cont.GetInfo()
+		cinfo, err := cont.GetInfo(false)
 		if err != nil {
-			return nil, err
+			errs.append(name, "GetInfo", err)
 		}
 		spec := self.getV2Spec(cinfo)
 		specs[name] = spec
 	}
-	return specs, nil
+	return specs, errs.OrNil()
 }
 
 // Get V2 container spec from v1 container info.
 func (self *manager) getV2Spec(cinfo *containerInfo) v2.ContainerSpec {
-	specV1 := self.getAdjustedSpec(cinfo)
-	specV2 := v2.ContainerSpec{
-		CreationTime:     specV1.CreationTime,
-		HasCpu:           specV1.HasCpu,
-		HasMemory:        specV1.HasMemory,
-		HasFilesystem:    specV1.HasFilesystem,
-		HasNetwork:       specV1.HasNetwork,
-		HasDiskIo:        specV1.HasDiskIo,
-		HasCustomMetrics: specV1.HasCustomMetrics,
-		Image:            specV1.Image,
-	}
-	if specV1.HasCpu {
-		specV2.Cpu.Limit = specV1.Cpu.Limit
-		specV2.Cpu.MaxLimit = specV1.Cpu.MaxLimit
-		specV2.Cpu.Mask = specV1.Cpu.Mask
-	}
-	if specV1.HasMemory {
-		specV2.Memory.Limit = specV1.Memory.Limit
-		specV2.Memory.Reservation = specV1.Memory.Reservation
-		specV2.Memory.SwapLimit = specV1.Memory.SwapLimit
-	}
-	if specV1.HasCustomMetrics {
-		specV2.CustomMetrics = specV1.CustomMetrics
-	}
-	specV2.Aliases = cinfo.Aliases
-	specV2.Namespace = cinfo.Namespace
-	return specV2
+	spec := self.getAdjustedSpec(cinfo)
+	return v2.ContainerSpecFromV1(&spec, cinfo.Aliases, cinfo.Namespace)
 }
 
 func (self *manager) getAdjustedSpec(cinfo *containerInfo) info.ContainerSpec {
@@ -407,13 +531,14 @@ func (self *manager) getAdjustedSpec(cinfo *containerInfo) info.ContainerSpec {
 	if spec.HasMemory {
 		// Memory.Limit is 0 means there's no limit
 		if spec.Memory.Limit == 0 {
+			self.machineMu.RLock()
 			spec.Memory.Limit = uint64(self.machineInfo.MemoryCapacity)
+			self.machineMu.RUnlock()
 		}
 	}
 	return spec
 }
 
-// Get a container by name.
 func (self *manager) GetContainerInfo(containerName string, query *info.ContainerInfoRequest) (*info.ContainerInfo, error) {
 	cont, err := self.getContainerData(containerName)
 	if err != nil {
@@ -422,9 +547,43 @@ func (self *manager) GetContainerInfo(containerName string, query *info.Containe
 	return self.containerDataToContainerInfo(cont, query)
 }
 
+func (self *manager) GetContainerInfoV2(containerName string, options v2.RequestOptions) (map[string]v2.ContainerInfo, error) {
+	containers, err := self.getRequestedContainers(containerName, options)
+	if err != nil {
+		return nil, err
+	}
+
+	var errs partialFailure
+	var nilTime time.Time // Ignored.
+
+	infos := make(map[string]v2.ContainerInfo, len(containers))
+	for name, container := range containers {
+		result := v2.ContainerInfo{}
+		cinfo, err := container.GetInfo(false)
+		if err != nil {
+			errs.append(name, "GetInfo", err)
+			infos[name] = result
+			continue
+		}
+		result.Spec = self.getV2Spec(cinfo)
+
+		stats, err := self.memoryCache.RecentStats(name, nilTime, nilTime, options.Count)
+		if err != nil {
+			errs.append(name, "RecentStats", err)
+			infos[name] = result
+			continue
+		}
+
+		result.Stats = v2.ContainerStatsFromV1(containerName, &cinfo.Spec, stats)
+		infos[name] = result
+	}
+
+	return infos, errs.OrNil()
+}
+
 func (self *manager) containerDataToContainerInfo(cont *containerData, query *info.ContainerInfoRequest) (*info.ContainerInfo, error) {
 	// Get the info from the container.
-	cinfo, err := cont.GetInfo()
+	cinfo, err := cont.GetInfo(true)
 	if err != nil {
 		return nil, err
 	}
@@ -501,6 +660,11 @@ func (self *manager) AllDockerContainers(query *info.ContainerInfoRequest) (map[
 	for name, cont := range containers {
 		inf, err := self.containerDataToContainerInfo(cont, query)
 		if err != nil {
+			// Ignore the error because of race condition and return best-effort result.
+			if err == memory.ErrDataNotFound {
+				klog.Warningf("Error getting data for container %s because of race condition", name)
+				continue
+			}
 			return nil, err
 		}
 		output[name] = *inf
@@ -517,9 +681,24 @@ func (self *manager) getDockerContainer(containerName string) (*containerData, e
 		Namespace: docker.DockerNamespace,
 		Name:      containerName,
 	}]
+
+	// Look for container by short prefix name if no exact match found.
 	if !ok {
-		return nil, fmt.Errorf("unable to find Docker container %q", containerName)
+		for contName, c := range self.containers {
+			if contName.Namespace == docker.DockerNamespace && strings.HasPrefix(contName.Name, containerName) {
+				if cont == nil {
+					cont = c
+				} else {
+					return nil, fmt.Errorf("unable to find container. Container %q is not unique", containerName)
+				}
+			}
+		}
+
+		if cont == nil {
+			return nil, fmt.Errorf("unable to find Docker container %q", containerName)
+		}
 	}
+
 	return cont, nil
 }
 
@@ -560,6 +739,7 @@ func (self *manager) GetRequestedContainersInfo(containerName string, options v2
 	if err != nil {
 		return nil, err
 	}
+	var errs partialFailure
 	containersMap := make(map[string]*info.ContainerInfo)
 	query := info.ContainerInfoRequest{
 		NumStats: options.Count,
@@ -567,12 +747,11 @@ func (self *manager) GetRequestedContainersInfo(containerName string, options v2
 	for name, data := range containers {
 		info, err := self.containerDataToContainerInfo(data, &query)
 		if err != nil {
-			// Skip containers with errors, we try to degrade gracefully.
-			continue
+			errs.append(name, "containerDataToContainerInfo", err)
 		}
 		containersMap[name] = info
 	}
-	return containersMap, nil
+	return containersMap, errs.OrNil()
 }
 
 func (self *manager) getRequestedContainers(containerName string, options v2.RequestOptions) (map[string]*containerData, error) {
@@ -608,7 +787,35 @@ func (self *manager) getRequestedContainers(containerName string, options v2.Req
 	default:
 		return containersMap, fmt.Errorf("invalid request type %q", options.IdType)
 	}
+	if options.MaxAge != nil {
+		// update stats for all containers in containersMap
+		var waitGroup sync.WaitGroup
+		waitGroup.Add(len(containersMap))
+		for _, container := range containersMap {
+			go func(cont *containerData) {
+				cont.OnDemandHousekeeping(*options.MaxAge)
+				waitGroup.Done()
+			}(container)
+		}
+		waitGroup.Wait()
+	}
 	return containersMap, nil
+}
+
+func (self *manager) GetDirFsInfo(dir string) (v2.FsInfo, error) {
+	device, err := self.fsInfo.GetDirFsDevice(dir)
+	if err != nil {
+		return v2.FsInfo{}, fmt.Errorf("failed to get device for dir %q: %v", dir, err)
+	}
+	return self.getFsInfoByDeviceName(device.Device)
+}
+
+func (self *manager) GetFsInfoByFsUUID(uuid string) (v2.FsInfo, error) {
+	device, err := self.fsInfo.GetDeviceInfoByFsUUID(uuid)
+	if err != nil {
+		return v2.FsInfo{}, err
+	}
+	return self.getFsInfoByDeviceName(device.Device)
 }
 
 func (self *manager) GetFsInfo(label string) ([]v2.FsInfo, error) {
@@ -626,7 +833,8 @@ func (self *manager) GetFsInfo(label string) ([]v2.FsInfo, error) {
 		}
 	}
 	fsInfo := []v2.FsInfo{}
-	for _, fs := range stats[0].Filesystem {
+	for i := range stats[0].Filesystem {
+		fs := stats[0].Filesystem[i]
 		if len(label) != 0 && fs.Device != dev {
 			continue
 		}
@@ -638,7 +846,9 @@ func (self *manager) GetFsInfo(label string) ([]v2.FsInfo, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		fi := v2.FsInfo{
+			Timestamp:  stats[0].Timestamp,
 			Device:     fs.Device,
 			Mountpoint: mountpoint,
 			Capacity:   fs.Limit,
@@ -646,12 +856,18 @@ func (self *manager) GetFsInfo(label string) ([]v2.FsInfo, error) {
 			Available:  fs.Available,
 			Labels:     labels,
 		}
+		if fs.HasInodes {
+			fi.Inodes = &fs.Inodes
+			fi.InodesFree = &fs.InodesFree
+		}
 		fsInfo = append(fsInfo, fi)
 	}
 	return fsInfo, nil
 }
 
 func (m *manager) GetMachineInfo() (*info.MachineInfo, error) {
+	m.machineMu.RLock()
+	defer m.machineMu.RUnlock()
 	// Copy and return the MachineInfo.
 	return &m.machineInfo, nil
 }
@@ -682,6 +898,8 @@ func (m *manager) Exists(containerName string) bool {
 func (m *manager) GetProcessList(containerName string, options v2.RequestOptions) ([]v2.ProcessInfo, error) {
 	// override recursive. Only support single container listing.
 	options.Recursive = false
+	// override MaxAge.  ProcessList does not require updated stats.
+	options.MaxAge = nil
 	conts, err := m.getRequestedContainers(containerName, options)
 	if err != nil {
 		return nil, err
@@ -706,44 +924,85 @@ func (m *manager) registerCollectors(collectorConfigs map[string]string, cont *c
 		if err != nil {
 			return fmt.Errorf("failed to read config file %q for config %q, container %q: %v", k, v, cont.info.Name, err)
 		}
-		glog.V(3).Infof("Got config from %q: %q", v, configFile)
+		klog.V(4).Infof("Got config from %q: %q", v, configFile)
 
 		if strings.HasPrefix(k, "prometheus") || strings.HasPrefix(k, "Prometheus") {
-			newCollector, err := collector.NewPrometheusCollector(k, configFile)
+			newCollector, err := collector.NewPrometheusCollector(k, configFile, *applicationMetricsCountLimit, cont.handler, m.collectorHttpClient)
 			if err != nil {
-				glog.Infof("failed to create collector for container %q, config %q: %v", cont.info.Name, k, err)
-				return err
+				return fmt.Errorf("failed to create collector for container %q, config %q: %v", cont.info.Name, k, err)
 			}
 			err = cont.collectorManager.RegisterCollector(newCollector)
 			if err != nil {
-				glog.Infof("failed to register collector for container %q, config %q: %v", cont.info.Name, k, err)
-				return err
+				return fmt.Errorf("failed to register collector for container %q, config %q: %v", cont.info.Name, k, err)
 			}
 		} else {
-			newCollector, err := collector.NewCollector(k, configFile)
+			newCollector, err := collector.NewCollector(k, configFile, *applicationMetricsCountLimit, cont.handler, m.collectorHttpClient)
 			if err != nil {
-				glog.Infof("failed to create collector for container %q, config %q: %v", cont.info.Name, k, err)
-				return err
+				return fmt.Errorf("failed to create collector for container %q, config %q: %v", cont.info.Name, k, err)
 			}
 			err = cont.collectorManager.RegisterCollector(newCollector)
 			if err != nil {
-				glog.Infof("failed to register collector for container %q, config %q: %v", cont.info.Name, k, err)
-				return err
+				return fmt.Errorf("failed to register collector for container %q, config %q: %v", cont.info.Name, k, err)
 			}
 		}
 	}
 	return nil
 }
 
+// Enables overwriting an existing containerData/Handler object for a given containerName.
+// Can't use createContainer as it just returns if a given containerName has a handler already.
+// Ex: rkt handler will want to take priority over the raw handler, but the raw handler might be created first.
+
+// Only allow raw handler to be overridden
+func (m *manager) overrideContainer(containerName string, watchSource watcher.ContainerWatchSource) error {
+	m.containersLock.Lock()
+	defer m.containersLock.Unlock()
+
+	namespacedName := namespacedContainerName{
+		Name: containerName,
+	}
+
+	if _, ok := m.containers[namespacedName]; ok {
+		containerData := m.containers[namespacedName]
+
+		if containerData.handler.Type() != container.ContainerTypeRaw {
+			return nil
+		}
+
+		err := m.destroyContainerLocked(containerName)
+		if err != nil {
+			return fmt.Errorf("overrideContainer: failed to destroy containerData/handler for %v: %v", containerName, err)
+		}
+	}
+
+	return m.createContainerLocked(containerName, watchSource)
+}
+
 // Create a container.
-func (m *manager) createContainer(containerName string) error {
-	handler, accept, err := container.NewContainerHandler(containerName, m.inHostNamespace)
+func (m *manager) createContainer(containerName string, watchSource watcher.ContainerWatchSource) error {
+	m.containersLock.Lock()
+	defer m.containersLock.Unlock()
+
+	return m.createContainerLocked(containerName, watchSource)
+}
+
+func (m *manager) createContainerLocked(containerName string, watchSource watcher.ContainerWatchSource) error {
+	namespacedName := namespacedContainerName{
+		Name: containerName,
+	}
+
+	// Check that the container didn't already exist.
+	if _, ok := m.containers[namespacedName]; ok {
+		return nil
+	}
+
+	handler, accept, err := container.NewContainerHandler(containerName, watchSource, m.inHostNamespace)
 	if err != nil {
 		return err
 	}
 	if !accept {
 		// ignoring this container.
-		glog.V(4).Infof("ignoring container %q", containerName)
+		klog.V(4).Infof("ignoring container %q", containerName)
 		return nil
 	}
 	collectorManager, err := collector.NewCollectorManager()
@@ -752,9 +1011,18 @@ func (m *manager) createContainer(containerName string) error {
 	}
 
 	logUsage := *logCadvisorUsage && containerName == m.cadvisorContainer
-	cont, err := newContainerData(containerName, m.memoryCache, handler, m.loadReader, logUsage, collectorManager, m.maxHousekeepingInterval, m.allowDynamicHousekeeping)
+	cont, err := newContainerData(containerName, m.memoryCache, handler, logUsage, collectorManager, m.maxHousekeepingInterval, m.allowDynamicHousekeeping, clock.RealClock{})
 	if err != nil {
 		return err
+	}
+	devicesCgroupPath, err := handler.GetCgroupPath("devices")
+	if err != nil {
+		klog.Warningf("Error getting devices cgroup path: %v", err)
+	} else {
+		cont.nvidiaCollector, err = m.nvidiaManager.GetCollector(devicesCgroupPath)
+		if err != nil {
+			klog.V(4).Infof("GPU metrics may be unavailable/incomplete for container %q: %v", cont.info.Name, err)
+		}
 	}
 
 	// Add collectors
@@ -762,40 +1030,19 @@ func (m *manager) createContainer(containerName string) error {
 	collectorConfigs := collector.GetCollectorConfigs(labels)
 	err = m.registerCollectors(collectorConfigs, cont)
 	if err != nil {
-		glog.Infof("failed to register collectors for %q: %v", containerName, err)
-		return err
+		klog.Warningf("Failed to register collectors for %q: %v", containerName, err)
 	}
 
-	// Add to the containers map.
-	alreadyExists := func() bool {
-		m.containersLock.Lock()
-		defer m.containersLock.Unlock()
-
-		namespacedName := namespacedContainerName{
-			Name: containerName,
-		}
-
-		// Check that the container didn't already exist.
-		_, ok := m.containers[namespacedName]
-		if ok {
-			return true
-		}
-
-		// Add the container name and all its aliases. The aliases must be within the namespace of the factory.
-		m.containers[namespacedName] = cont
-		for _, alias := range cont.info.Aliases {
-			m.containers[namespacedContainerName{
-				Namespace: cont.info.Namespace,
-				Name:      alias,
-			}] = cont
-		}
-
-		return false
-	}()
-	if alreadyExists {
-		return nil
+	// Add the container name and all its aliases. The aliases must be within the namespace of the factory.
+	m.containers[namespacedName] = cont
+	for _, alias := range cont.info.Aliases {
+		m.containers[namespacedContainerName{
+			Namespace: cont.info.Namespace,
+			Name:      alias,
+		}] = cont
 	}
-	glog.V(3).Infof("Added container: %q (aliases: %v, namespace: %q)", containerName, cont.info.Aliases, cont.info.Namespace)
+
+	klog.V(3).Infof("Added container: %q (aliases: %v, namespace: %q)", containerName, cont.info.Aliases, cont.info.Namespace)
 
 	contSpec, err := cont.handler.GetSpec()
 	if err != nil {
@@ -818,15 +1065,17 @@ func (m *manager) createContainer(containerName string) error {
 	}
 
 	// Start the container's housekeeping.
-	cont.Start()
-
-	return nil
+	return cont.Start()
 }
 
 func (m *manager) destroyContainer(containerName string) error {
 	m.containersLock.Lock()
 	defer m.containersLock.Unlock()
 
+	return m.destroyContainerLocked(containerName)
+}
+
+func (m *manager) destroyContainerLocked(containerName string) error {
 	namespacedName := namespacedContainerName{
 		Name: containerName,
 	}
@@ -850,7 +1099,7 @@ func (m *manager) destroyContainer(containerName string) error {
 			Name:      alias,
 		})
 	}
-	glog.V(3).Infof("Destroyed container: %q (aliases: %v, namespace: %q)", containerName, cont.info.Aliases, cont.info.Namespace)
+	klog.V(3).Infof("Destroyed container: %q (aliases: %v, namespace: %q)", containerName, cont.info.Aliases, cont.info.Namespace)
 
 	contRef, err := cont.handler.ContainerReference()
 	if err != nil {
@@ -871,21 +1120,24 @@ func (m *manager) destroyContainer(containerName string) error {
 
 // Detect all containers that have been added or deleted from the specified container.
 func (m *manager) getContainersDiff(containerName string) (added []info.ContainerReference, removed []info.ContainerReference, err error) {
-	m.containersLock.RLock()
-	defer m.containersLock.RUnlock()
-
 	// Get all subcontainers recursively.
+	m.containersLock.RLock()
 	cont, ok := m.containers[namespacedContainerName{
 		Name: containerName,
 	}]
+	m.containersLock.RUnlock()
 	if !ok {
 		return nil, nil, fmt.Errorf("failed to find container %q while checking for new containers", containerName)
 	}
 	allContainers, err := cont.handler.ListContainers(container.ListRecursive)
+
 	if err != nil {
 		return nil, nil, err
 	}
 	allContainers = append(allContainers, info.ContainerReference{Name: containerName})
+
+	m.containersLock.RLock()
+	defer m.containersLock.RUnlock()
 
 	// Determine which were added and which were removed.
 	allContainersSet := make(map[string]*containerData)
@@ -924,9 +1176,9 @@ func (m *manager) detectSubcontainers(containerName string) error {
 
 	// Add the new containers.
 	for _, cont := range added {
-		err = m.createContainer(cont.Name)
+		err = m.createContainer(cont.Name, watcher.Raw)
 		if err != nil {
-			glog.Errorf("Failed to create existing container: %s: %s", cont.Name, err)
+			klog.Errorf("Failed to create existing container: %s: %s", cont.Name, err)
 		}
 	}
 
@@ -934,7 +1186,7 @@ func (m *manager) detectSubcontainers(containerName string) error {
 	for _, cont := range removed {
 		err = m.destroyContainer(cont.Name)
 		if err != nil {
-			glog.Errorf("Failed to destroy existing container: %s: %s", cont.Name, err)
+			klog.Errorf("Failed to destroy existing container: %s: %s", cont.Name, err)
 		}
 	}
 
@@ -943,28 +1195,15 @@ func (m *manager) detectSubcontainers(containerName string) error {
 
 // Watches for new containers started in the system. Runs forever unless there is a setup error.
 func (self *manager) watchForNewContainers(quit chan error) error {
-	var root *containerData
-	var ok bool
-	func() {
-		self.containersLock.RLock()
-		defer self.containersLock.RUnlock()
-		root, ok = self.containers[namespacedContainerName{
-			Name: "/",
-		}]
-	}()
-	if !ok {
-		return fmt.Errorf("root container does not exist when watching for new containers")
-	}
-
-	// Register for new subcontainers.
-	eventsChannel := make(chan container.SubcontainerEvent, 16)
-	err := root.handler.WatchSubcontainers(eventsChannel)
-	if err != nil {
-		return err
+	for _, watcher := range self.containerWatchers {
+		err := watcher.Start(self.eventsChannel)
+		if err != nil {
+			return err
+		}
 	}
 
 	// There is a race between starting the watch and new container creation so we do a detection before we read new containers.
-	err = self.detectSubcontainers("/")
+	err := self.detectSubcontainers("/")
 	if err != nil {
 		return err
 	}
@@ -973,22 +1212,38 @@ func (self *manager) watchForNewContainers(quit chan error) error {
 	go func() {
 		for {
 			select {
-			case event := <-eventsChannel:
+			case event := <-self.eventsChannel:
 				switch {
-				case event.EventType == container.SubcontainerAdd:
-					err = self.createContainer(event.Name)
-				case event.EventType == container.SubcontainerDelete:
+				case event.EventType == watcher.ContainerAdd:
+					switch event.WatchSource {
+					// the Rkt and Raw watchers can race, and if Raw wins, we want Rkt to override and create a new handler for Rkt containers
+					case watcher.Rkt:
+						err = self.overrideContainer(event.Name, event.WatchSource)
+					default:
+						err = self.createContainer(event.Name, event.WatchSource)
+					}
+				case event.EventType == watcher.ContainerDelete:
 					err = self.destroyContainer(event.Name)
 				}
 				if err != nil {
-					glog.Warningf("Failed to process watch event: %v", err)
+					klog.Warningf("Failed to process watch event %+v: %v", event, err)
 				}
 			case <-quit:
+				var errs partialFailure
+
 				// Stop processing events if asked to quit.
-				err := root.handler.StopWatchingSubcontainers()
-				quit <- err
-				if err == nil {
-					glog.Infof("Exiting thread watching subcontainers")
+				for i, watcher := range self.containerWatchers {
+					err := watcher.Stop()
+					if err != nil {
+						errs.append(fmt.Sprintf("watcher %d", i), "Stop", err)
+					}
+				}
+
+				if len(errs) > 0 {
+					quit <- errs
+				} else {
+					quit <- nil
+					klog.Infof("Exiting thread watching subcontainers")
 					return
 				}
 			}
@@ -998,7 +1253,7 @@ func (self *manager) watchForNewContainers(quit chan error) error {
 }
 
 func (self *manager) watchForNewOoms() error {
-	glog.Infof("Started watching for new ooms in manager")
+	klog.V(2).Infof("Started watching for new ooms in manager")
 	outStream := make(chan *oomparser.OomInstance, 10)
 	oomLog, err := oomparser.New()
 	if err != nil {
@@ -1016,9 +1271,9 @@ func (self *manager) watchForNewOoms() error {
 			}
 			err := self.eventHandler.AddEvent(newEvent)
 			if err != nil {
-				glog.Errorf("failed to add OOM event for %q: %v", oomInstance.ContainerName, err)
+				klog.Errorf("failed to add OOM event for %q: %v", oomInstance.ContainerName, err)
 			}
-			glog.V(3).Infof("Created an OOM event in container %q at %v", oomInstance.ContainerName, oomInstance.TimeOfDeath)
+			klog.V(3).Infof("Created an OOM event in container %q at %v", oomInstance.ContainerName, oomInstance.TimeOfDeath)
 
 			newEvent = &info.Event{
 				ContainerName: oomInstance.VictimContainerName,
@@ -1033,7 +1288,7 @@ func (self *manager) watchForNewOoms() error {
 			}
 			err = self.eventHandler.AddEvent(newEvent)
 			if err != nil {
-				glog.Errorf("failed to add OOM kill event for %q: %v", oomInstance.ContainerName, err)
+				klog.Errorf("failed to add OOM kill event for %q: %v", oomInstance.ContainerName, err)
 			}
 		}
 	}()
@@ -1064,12 +1319,12 @@ func parseEventsStoragePolicy() events.StoragePolicy {
 	for _, part := range parts {
 		items := strings.Split(part, "=")
 		if len(items) != 2 {
-			glog.Warningf("Unknown event storage policy %q when parsing max age", part)
+			klog.Warningf("Unknown event storage policy %q when parsing max age", part)
 			continue
 		}
 		dur, err := time.ParseDuration(items[1])
 		if err != nil {
-			glog.Warningf("Unable to parse event max age duration %q: %v", items[1], err)
+			klog.Warningf("Unable to parse event max age duration %q: %v", items[1], err)
 			continue
 		}
 		if items[0] == "default" {
@@ -1084,12 +1339,12 @@ func parseEventsStoragePolicy() events.StoragePolicy {
 	for _, part := range parts {
 		items := strings.Split(part, "=")
 		if len(items) != 2 {
-			glog.Warningf("Unknown event storage policy %q when parsing max event limit", part)
+			klog.Warningf("Unknown event storage policy %q when parsing max event limit", part)
 			continue
 		}
 		val, err := strconv.Atoi(items[1])
 		if err != nil {
-			glog.Warningf("Unable to parse integer from %q: %v", items[1], err)
+			klog.Warningf("Unable to parse integer from %q: %v", items[1], err)
 			continue
 		}
 		if items[0] == "default" {
@@ -1102,109 +1357,12 @@ func parseEventsStoragePolicy() events.StoragePolicy {
 	return policy
 }
 
-type DockerStatus struct {
-	Version       string            `json:"version"`
-	KernelVersion string            `json:"kernel_version"`
-	OS            string            `json:"os"`
-	Hostname      string            `json:"hostname"`
-	RootDir       string            `json:"root_dir"`
-	Driver        string            `json:"driver"`
-	DriverStatus  map[string]string `json:"driver_status"`
-	ExecDriver    string            `json:"exec_driver"`
-	NumImages     int               `json:"num_images"`
-	NumContainers int               `json:"num_containers"`
+func (m *manager) DockerImages() ([]info.DockerImage, error) {
+	return docker.Images()
 }
 
-type DockerImage struct {
-	ID          string   `json:"id"`
-	RepoTags    []string `json:"repo_tags"` // repository name and tags.
-	Created     int64    `json:"created"`   // unix time since creation.
-	VirtualSize int64    `json:"virtual_size"`
-	Size        int64    `json:"size"`
-}
-
-func (m *manager) DockerImages() ([]DockerImage, error) {
-	images, err := docker.DockerImages()
-	if err != nil {
-		return nil, err
-	}
-	out := []DockerImage{}
-	const unknownTag = "<none>:<none>"
-	for _, image := range images {
-		if len(image.RepoTags) == 1 && image.RepoTags[0] == unknownTag {
-			// images with repo or tags are uninteresting.
-			continue
-		}
-		di := DockerImage{
-			ID:          image.ID,
-			RepoTags:    image.RepoTags,
-			Created:     image.Created,
-			VirtualSize: image.VirtualSize,
-			Size:        image.Size,
-		}
-		out = append(out, di)
-	}
-	return out, nil
-}
-
-func (m *manager) DockerInfo() (DockerStatus, error) {
-	info, err := docker.DockerInfo()
-	if err != nil {
-		return DockerStatus{}, err
-	}
-	versionInfo, err := m.GetVersionInfo()
-	if err != nil {
-		return DockerStatus{}, err
-	}
-	out := DockerStatus{}
-	out.Version = versionInfo.DockerVersion
-	if val, ok := info["KernelVersion"]; ok {
-		out.KernelVersion = val
-	}
-	if val, ok := info["OperatingSystem"]; ok {
-		out.OS = val
-	}
-	if val, ok := info["Name"]; ok {
-		out.Hostname = val
-	}
-	if val, ok := info["DockerRootDir"]; ok {
-		out.RootDir = val
-	}
-	if val, ok := info["Driver"]; ok {
-		out.Driver = val
-	}
-	if val, ok := info["ExecutionDriver"]; ok {
-		out.ExecDriver = val
-	}
-	if val, ok := info["Images"]; ok {
-		n, err := strconv.Atoi(val)
-		if err == nil {
-			out.NumImages = n
-		}
-	}
-	if val, ok := info["Containers"]; ok {
-		n, err := strconv.Atoi(val)
-		if err == nil {
-			out.NumContainers = n
-		}
-	}
-	// cut, trim, cut - Example format:
-	// DriverStatus=[["Root Dir","/var/lib/docker/aufs"],["Backing Filesystem","extfs"],["Dirperm1 Supported","false"]]
-	if val, ok := info["DriverStatus"]; ok {
-		out.DriverStatus = make(map[string]string)
-		val = strings.TrimPrefix(val, "[[")
-		val = strings.TrimSuffix(val, "]]")
-		vals := strings.Split(val, "],[")
-		for _, v := range vals {
-			kv := strings.Split(v, "\",\"")
-			if len(kv) != 2 {
-				continue
-			} else {
-				out.DriverStatus[strings.Trim(kv[0], "\"")] = strings.Trim(kv[1], "\"")
-			}
-		}
-	}
-	return out, nil
+func (m *manager) DockerInfo() (info.DockerStatus, error) {
+	return docker.Status()
 }
 
 func (m *manager) DebugInfo() map[string][]string {
@@ -1240,4 +1398,62 @@ func (m *manager) DebugInfo() map[string][]string {
 
 	debugInfo["Managed containers"] = lines
 	return debugInfo
+}
+
+func (self *manager) getFsInfoByDeviceName(deviceName string) (v2.FsInfo, error) {
+	mountPoint, err := self.fsInfo.GetMountpointForDevice(deviceName)
+	if err != nil {
+		return v2.FsInfo{}, fmt.Errorf("failed to get mount point for device %q: %v", deviceName, err)
+	}
+	infos, err := self.GetFsInfo("")
+	if err != nil {
+		return v2.FsInfo{}, err
+	}
+	for _, info := range infos {
+		if info.Mountpoint == mountPoint {
+			return info, nil
+		}
+	}
+	return v2.FsInfo{}, fmt.Errorf("cannot find filesystem info for device %q", deviceName)
+}
+
+func getVersionInfo() (*info.VersionInfo, error) {
+
+	kernel_version := machine.KernelVersion()
+	container_os := machine.ContainerOsVersion()
+	docker_version, err := docker.VersionString()
+	if err != nil {
+		return nil, err
+	}
+	docker_api_version, err := docker.APIVersionString()
+	if err != nil {
+		return nil, err
+	}
+
+	return &info.VersionInfo{
+		KernelVersion:      kernel_version,
+		ContainerOsVersion: container_os,
+		DockerVersion:      docker_version,
+		DockerAPIVersion:   docker_api_version,
+		CadvisorVersion:    version.Info["version"],
+		CadvisorRevision:   version.Info["revision"],
+	}, nil
+}
+
+// Helper for accumulating partial failures.
+type partialFailure []string
+
+func (f *partialFailure) append(id, operation string, err error) {
+	*f = append(*f, fmt.Sprintf("[%q: %s: %s]", id, operation, err))
+}
+
+func (f partialFailure) Error() string {
+	return fmt.Sprintf("partial failures: %s", strings.Join(f, ", "))
+}
+
+func (f partialFailure) OrNil() error {
+	if len(f) == 0 {
+		return nil
+	}
+	return f
 }
